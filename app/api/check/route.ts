@@ -6,39 +6,35 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-type Input = { url: string };
-
 export async function OPTIONS() {
   return new Response(null, { status: 204, headers: corsHeaders });
 }
 
-// --- PSI helper (mobile)
-async function fetchPsiPerformance(url: string): Promise<number | undefined> {
+// PageSpeed Insights (mobile)
+async function fetchPsiPerformance(url) {
   try {
-    const key = (process as any).env?.PSI_API_KEY; // set in Vercel → Project → Settings → Environment Variables
-    const psiUrl = new URL("https://www.googleapis.com/pagespeedonline/v5/runPagespeed");
-    psiUrl.searchParams.set("url", url);
-    psiUrl.searchParams.set("strategy", "mobile");
-    if (key) psiUrl.searchParams.set("key", key);
+    const key = process.env.PSI_API_KEY;
+    const u = new URL("https://www.googleapis.com/pagespeedonline/v5/runPagespeed");
+    u.searchParams.set("url", url);
+    u.searchParams.set("strategy", "mobile");
+    if (key) u.searchParams.set("key", key);
 
-    const res = await fetch(psiUrl.toString());
+    const res = await fetch(u.toString());
     if (!res.ok) return undefined;
     const data = await res.json();
     const score = data?.lighthouseResult?.categories?.performance?.score; // 0–1
     if (typeof score === "number") return Math.round(score * 100);
-  } catch {
-    // ignore PSI errors for resilience
-  }
+  } catch {}
   return undefined;
 }
 
-export async function POST(req: Request) {
+export async function POST(req) {
   try {
-    const body = (await req.json()) as Input;
+    const body = await req.json();
     if (!body?.url) {
       return new Response(JSON.stringify({ ok: false, errors: ["Invalid URL"] }), {
         status: 400,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        headers: { ...corsHeaders, "Content-Type": "application/json" }
       });
     }
 
@@ -54,7 +50,7 @@ export async function POST(req: Request) {
     const m = /<title>([\s\S]*?)<\/title>/i.exec(html);
     const title = m ? m[1].trim() : "";
 
-    // Optional: PSI score
+    // Optional PSI
     const psiScore = await fetchPsiPerformance(normalizedUrl);
 
     const result = {
@@ -64,17 +60,17 @@ export async function POST(req: Request) {
       fetchedStatus: pageRes.status,
       timingMs,
       title,
-      speed: psiScore, // 0–100, undefined if no key
+      speed: psiScore // 0–100, or undefined if no key/API error
     };
 
     return new Response(JSON.stringify(result), {
       status: 200,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
+      headers: { ...corsHeaders, "Content-Type": "application/json" }
     });
-  } catch (e: any) {
+  } catch (e) {
     return new Response(JSON.stringify({ ok: false, errors: [e?.message || "Unknown error"] }), {
       status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
+      headers: { ...corsHeaders, "Content-Type": "application/json" }
     });
   }
 }
