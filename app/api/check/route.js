@@ -1,5 +1,5 @@
 // app/api/check/route.js
-// Prefer Node for longer time limits + fewer host blocks (you can switch to "edge" if you want).
+// Prefer Node for longer time limits + fewer host blocks
 export const runtime = "nodejs";
 
 /** ---------- polite request headers for target sites ---------- */
@@ -15,7 +15,7 @@ function corsHeadersFrom(req) {
   const reqHdrs = req?.headers?.get("access-control-request-headers") || "Content-Type";
   return {
     "Access-Control-Allow-Origin": origin,
-    "Vary": "Origin",
+    Vary: "Origin",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
     "Access-Control-Allow-Headers": reqHdrs,
     "Access-Control-Max-Age": "86400",
@@ -31,7 +31,7 @@ export async function OPTIONS(req) {
   return new Response(null, { status: 204, headers: corsHeadersFrom(req) });
 }
 
-/** 
+/**
  * GET
  * - /api/check            -> health ping
  * - /api/check?url=...    -> run audit (no preflight)
@@ -39,9 +39,7 @@ export async function OPTIONS(req) {
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
   const rawUrl = searchParams.get("url");
-  if (!rawUrl) {
-    return json(req, 200, { ok: true, ping: "pong" });
-  }
+  if (!rawUrl) return json(req, 200, { ok: true, ping: "pong" });
   try {
     return await runAudit(req, rawUrl);
   } catch (e) {
@@ -59,31 +57,60 @@ const withTimeout = (ms = 12000) => {
   return { signal: c.signal, done: () => clearTimeout(id) };
 };
 
-const tryHeadThenGet = async (url, { timeoutMs = 12000, redirect = "follow" } = {}) => {
-  const t1 = withTimeout(timeoutMs);
-  try {
-    const r = await fetch(url, {
-      method: "HEAD",
-      redirect,
-      signal: t1.signal,
-      headers: UA_HEADERS,
-      cache: "no-store",
-    });
-    t1.done();
-    if (r.status === 405 || r.status === 501) throw new Error("HEAD not allowed");
-    return r;
-  } catch {
-    const t2 = withTimeout(timeoutMs);
-    const r = await fetch(url, {
-      method: "GET",
-      redirect,
-      signal: t2.signal,
-      headers: UA_HEADERS,
-      cache: "no-store",
-    });
-    t2.done();
-    return r;
+// Retry helper: retries fn() on AbortError or network-ish errors with backoff + jitter
+async function retry(fn, { tries = 2, baseDelay = 400 } = {}) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e?.message || "");
+      const isAbort = e?.name === "AbortError";
+      const isNetty = /fetch failed|network|ECONNRESET|EAI_AGAIN|ENOTFOUND|ETIMEDOUT/i.test(msg);
+      if (i < tries - 1 && (isAbort || isNetty)) {
+        const jitter = Math.floor(Math.random() * 250);
+        await new Promise((r) => setTimeout(r, baseDelay * (i + 1) + jitter));
+        continue;
+      }
+      throw e;
+    }
   }
+  throw lastErr;
+}
+
+const tryHeadThenGet = async (url, { timeoutMs = 12000, redirect = "follow" } = {}) => {
+  return retry(async () => {
+    // HEAD first
+    const t1 = withTimeout(timeoutMs);
+    try {
+      const r = await fetch(url, {
+        method: "HEAD",
+        redirect,
+        signal: t1.signal,
+        headers: UA_HEADERS,
+        cache: "no-store",
+      });
+      if (r.status === 405 || r.status === 501) throw new Error("HEAD not allowed");
+      return r;
+    } catch {
+      // Fallback to GET
+      const t2 = withTimeout(timeoutMs);
+      try {
+        return await fetch(url, {
+          method: "GET",
+          redirect,
+          signal: t2.signal,
+          headers: UA_HEADERS,
+          cache: "no-store",
+        });
+      } finally {
+        t2.done();
+      }
+    } finally {
+      t1.done();
+    }
+  });
 };
 
 const absUrl = (base, href) => {
@@ -156,20 +183,22 @@ export async function POST(req) {
 async function runAudit(req, rawUrl) {
   const normalizedUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
 
-  // Fetch the page with timeout + UA
+  // MAIN PAGE FETCH with timeout + UA + one retry
   const t0 = Date.now();
-  const to = withTimeout(12000);
-  let pageRes;
-  try {
-    pageRes = await fetch(normalizedUrl, {
-      redirect: "follow",
-      signal: to.signal,
-      headers: UA_HEADERS,
-      cache: "no-store",
-    });
-  } finally {
-    to.done();
-  }
+  const pageRes = await retry(async () => {
+    const to = withTimeout(12000);
+    try {
+      return await fetch(normalizedUrl, {
+        redirect: "follow",
+        signal: to.signal,
+        headers: UA_HEADERS,
+        cache: "no-store",
+      });
+    } finally {
+      to.done();
+    }
+  });
+
   const html = await pageRes.text();
   const timingMs = Date.now() - t0;
   const finalUrl = pageRes.url;
@@ -235,24 +264,26 @@ async function runAudit(req, rawUrl) {
   let robotsSitemapListed = false;
   try {
     const robotsURL = absUrl(origin + "/", "/robots.txt");
-    const tor = withTimeout(8000);
-    try {
-      const r = await fetch(robotsURL, {
-        redirect: "follow",
-        signal: tor.signal,
-        headers: UA_HEADERS,
-        cache: "no-store",
-      });
-      if (r.ok) {
-        robotsExists = true;
-        const text = await r.text();
-        const blocks = text.split(/(?=^User-agent:\s*)/gim);
-        const star = blocks.find((b) => /^User-agent:\s*\*/im.test(b)) || "";
-        if (/^\s*Disallow:\s*\/\s*$/im.test(star)) robotsAllowsIndex = false;
-        robotsSitemapListed = /(^|\n)\s*Sitemap:\s*https?:\/\//i.test(text);
+    const r = await retry(async () => {
+      const tor = withTimeout(8000);
+      try {
+        return await fetch(robotsURL, {
+          redirect: "follow",
+          signal: tor.signal,
+          headers: UA_HEADERS,
+          cache: "no-store",
+        });
+      } finally {
+        tor.done();
       }
-    } finally {
-      tor.done();
+    });
+    if (r.ok) {
+      robotsExists = true;
+      const text = await r.text();
+      const blocks = text.split(/(?=^User-agent:\s*)/gim);
+      const star = blocks.find((b) => /^User-agent:\s*\*/im.test(b)) || "";
+      if (/^\s*Disallow:\s*\/\s*$/im.test(star)) robotsAllowsIndex = false;
+      robotsSitemapListed = /(^|\n)\s*Sitemap:\s*https?:\/\//i.test(text);
     }
   } catch {}
   checks.push({
@@ -282,34 +313,36 @@ async function runAudit(req, rawUrl) {
   }
   if (sitemapUrl) {
     try {
-      const tos = withTimeout(12000);
-      try {
-        const r = await fetch(sitemapUrl, {
-          redirect: "follow",
-          signal: tos.signal,
-          headers: UA_HEADERS,
-          cache: "no-store",
-        });
-        if (r.ok) {
-          const xml = await r.text();
-          const locs = [...xml.matchAll(/<loc>([\s\S]*?)<\/loc>/gi)].map((m) => m[1].trim());
-          const absLocs = locs.map((h) => absUrl(sitemapUrl, h)).filter(Boolean);
-          sitemapHasUrls = absLocs.length > 0;
-          const toCheck = absLocs.slice(0, 5);
-          const results = await Promise.all(
-            toCheck.map(async (u) => {
-              try {
-                const rr = await tryHeadThenGet(u, { timeoutMs: 6000 });
-                return isOk(rr);
-              } catch {
-                return false;
-              }
-            })
-          );
-          sitemapSampleOk = results.filter(Boolean).length;
+      const r = await retry(async () => {
+        const tos = withTimeout(12000);
+        try {
+          return await fetch(sitemapUrl, {
+            redirect: "follow",
+            signal: tos.signal,
+            headers: UA_HEADERS,
+            cache: "no-store",
+          });
+        } finally {
+          tos.done();
         }
-      } finally {
-        tos.done();
+      });
+      if (r.ok) {
+        const xml = await r.text();
+        const locs = [...xml.matchAll(/<loc>([\s\S]*?)<\/loc>/gi)].map((m) => m[1].trim());
+        const absLocs = locs.map((h) => absUrl(sitemapUrl, h)).filter(Boolean);
+        sitemapHasUrls = absLocs.length > 0;
+        const toCheck = absLocs.slice(0, 5);
+        const results = await Promise.all(
+          toCheck.map(async (u) => {
+            try {
+              const rr = await tryHeadThenGet(u, { timeoutMs: 6000 });
+              return isOk(rr);
+            } catch {
+              return false;
+            }
+          })
+        );
+        sitemapSampleOk = results.filter(Boolean).length;
       }
     } catch {}
   }
@@ -329,30 +362,32 @@ async function runAudit(req, rawUrl) {
     if (variantHost !== host) {
       const variantOrigin = `${urlObj.protocol}//${variantHost}`;
       const variantUrl = variantOrigin + "/";
-      const tv = withTimeout(7000);
-      try {
-        const r = await fetch(variantUrl, {
-          method: "GET",
-          redirect: "manual",
-          signal: tv.signal,
-          headers: UA_HEADERS,
-          cache: "no-store",
-        });
-        const code = r.status;
-        const loc = r.headers.get("location");
-        let good = false;
-        let to2 = "";
-        if (loc) {
-          const resolved = absUrl(variantUrl, loc);
-          to2 = resolved || loc;
-          try {
-            good = new URL(to2).host === host && [301, 308, 302, 307].includes(code);
-          } catch {}
+      const r = await retry(async () => {
+        const tv = withTimeout(7000);
+        try {
+          return await fetch(variantUrl, {
+            method: "GET",
+            redirect: "manual",
+            signal: tv.signal,
+            headers: UA_HEADERS,
+            cache: "no-store",
+          });
+        } finally {
+          tv.done();
         }
-        canonicalization = { tested: true, from: variantUrl, to: to2, code, good };
-      } finally {
-        tv.done();
+      });
+      const code = r.status;
+      const loc = r.headers.get("location");
+      let good = false;
+      let to2 = "";
+      if (loc) {
+        const resolved = absUrl(variantUrl, loc);
+        to2 = resolved || loc;
+        try {
+          good = new URL(to2).host === host && [301, 308, 302, 307].includes(code);
+        } catch {}
       }
+      canonicalization = { tested: true, from: variantUrl, to: to2, code, good };
     }
   } catch {
     canonicalization = { tested: true, from: "", to: "", code: 0, good: false };
@@ -453,21 +488,23 @@ async function runAudit(req, rawUrl) {
   try {
     const httpUrl = finalUrl.replace(/^https:/i, "http:");
     if (httpUrl !== finalUrl) {
-      const th = withTimeout(7000);
-      try {
-        const r = await fetch(httpUrl, {
-          method: "GET",
-          redirect: "manual",
-          signal: th.signal,
-          headers: UA_HEADERS,
-          cache: "no-store",
-        });
-        httpCode = r.status;
-        httpLoc = r.headers.get("location") || "";
-        httpToHttps = httpLoc.startsWith("https://");
-      } finally {
-        th.done();
-      }
+      const r = await retry(async () => {
+        const th = withTimeout(7000);
+        try {
+          return await fetch(httpUrl, {
+            method: "GET",
+            redirect: "manual",
+            signal: th.signal,
+            headers: UA_HEADERS,
+            cache: "no-store",
+          });
+        } finally {
+          th.done();
+        }
+      });
+      httpCode = r.status;
+      httpLoc = r.headers.get("location") || "";
+      httpToHttps = httpLoc.startsWith("https://");
     }
   } catch {}
   checks.push({
@@ -477,7 +514,7 @@ async function runAudit(req, rawUrl) {
     details: httpCode ? `${httpCode} → ${httpLoc || "(no location)"}` : "Not applicable",
   });
 
-  /** -------- Security headers -------- */
+  /** -------- Security headers -------- 
   const h = pageRes.headers;
   const sec = {
     csp: !!h.get("content-security-policy"),
@@ -492,7 +529,7 @@ async function runAudit(req, rawUrl) {
     label: "Security headers",
     status: have >= 4 ? "pass" : have >= 2 ? "warn" : "fail",
     details: `CSP=${sec.csp} XFO=${sec.xfo} XCTO=${sec.xcto} Referrer-Policy=${sec.ref} HSTS=${sec.hsts}`,
-  });
+  }); */
 
   /** -------- Images: alt, format, size, lazy -------- */
   const imgTags = [...html.matchAll(/<img[^>]*>/gi)].map((m) => m[0]).slice(0, 40);
@@ -509,19 +546,21 @@ async function runAudit(req, rawUrl) {
   let huge = 0;
   for (const u of imgSrcs.slice(0, 8)) {
     try {
-      const th = withTimeout(6000);
-      try {
-        const r = await fetch(u, {
-          method: "HEAD",
-          signal: th.signal,
-          headers: UA_HEADERS,
-          cache: "no-store",
-        });
-        const len = parseInt(r.headers.get("content-length") || "0", 10);
-        if (len > 300_000) huge++;
-      } finally {
-        th.done();
-      }
+      const r = await retry(async () => {
+        const th = withTimeout(6000);
+        try {
+          return await fetch(u, {
+            method: "HEAD",
+            signal: th.signal,
+            headers: UA_HEADERS,
+            cache: "no-store",
+          });
+        } finally {
+          th.done();
+        }
+      });
+      const len = parseInt(r.headers.get("content-length") || "0", 10);
+      if (len > 300_000) huge++;
     } catch {}
   }
 
@@ -550,7 +589,7 @@ async function runAudit(req, rawUrl) {
     details: `${lazyCount} images with loading="lazy"`,
   });
 
-  /** -------- Mixed content (on HTTPS) -------- */
+  /** -------- Mixed content (on HTTPS) -------- 
   let mixed = 0;
   if (finalUrl.startsWith("https://")) {
     const httpRefs = [...html.matchAll(/\s(?:src|href)=["']http:\/\/[^"']+["']/gi)];
@@ -561,9 +600,9 @@ async function runAudit(req, rawUrl) {
     label: "No mixed content",
     status: mixed === 0 ? "pass" : mixed <= 3 ? "warn" : "fail",
     details: mixed ? `${mixed} http:// references` : "None detected",
-  });
+  }); */
 
-  /** -------- Structured data presence -------- */
+  /** -------- Structured data presence -------- 
   const jsonLdBlocks = [
     ...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi),
   ]
@@ -582,7 +621,7 @@ async function runAudit(req, rawUrl) {
     label: "Structured data (JSON-LD)",
     status: ldTypes.length ? "pass" : "warn",
     details: ldTypes.length ? `Types: ${Array.from(new Set(ldTypes)).join(", ").slice(0, 120)}` : "No JSON-LD found",
-  });
+  });*/
 
   /** -------- Compression -------- */
   const enc = pageRes.headers.get("content-encoding") || "";
