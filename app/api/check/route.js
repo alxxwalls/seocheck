@@ -38,8 +38,8 @@ const LIMITS = {
   IMAGE_HEADS: 2,         // was 4
   TIME_PAGE_MS: 6000,     // was 12000
   TIME_ASSET_MS: 2000,    // was 5000
-  TIME_SMALL_MS: 1500,    // was 4000
-  TIME_PSI_MS: 2500,      // was 10000
+  TIME_SMALL_MS: 2500,    // was 4000
+  TIME_PSI_MS: 3000,      // was 10000
   MAX_SUBREQUESTS: 8,     // was 12
 };
 
@@ -544,7 +544,7 @@ if (timeLeft() > 250) {
           return await fetch(robotsURL, {
             redirect: "follow",
             signal: tor.signal,
-            headers: UA_HEADERS,
+            headers: BROWSER_HEADERS,
             cache: "no-store",
           });
         } finally {
@@ -638,7 +638,7 @@ if (sitemapUrl) {
             return await fetch(sitemapUrl, {
               redirect: "follow",
               signal: tos.signal,
-              headers: UA_HEADERS,
+              headers: BROWSER_HEADERS,
               cache: "no-store",
             });
           } finally {
@@ -883,6 +883,7 @@ if (sitemapUrl) {
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
