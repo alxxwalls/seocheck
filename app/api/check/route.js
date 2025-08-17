@@ -763,30 +763,39 @@ const candidateSet = new Set([
 ]);
 const candidates = [...candidateSet].filter(Boolean);
 
-// find a reachable sitemap URL
-for (const u of candidates) {
+// find a reachable sitemap URL (prefer robots-listed first, then common paths)
+const robotsFirst = [...new Set([...(robotsSitemaps || []), ...candidateSet])];
+sitemapUrl = null;
+for (const u of robotsFirst) {
   if (timeLeft() < 250) break;
   try {
-    const h = await tryHeadThenGet(u, {
-      timeoutMs: within(LIMITS.TIME_SMALL_MS),
-      headers: BROWSER_HEADERS,
-      // fallbackOnNonOk true by default, so 301/302/405 will retry with GET
-    });
-
-    if (isOk(h) && !sitemapUrl) {
-      const final = h.url || u; // follow final URL after redirects
-      sitemapUrl = final;
-
-      const ct = (h.headers.get("content-type") || "").toLowerCase();
-      // keep on one line so the line doesn't begin with a regex literal
-      sitemapGzipped = (/\.gz(\?|#|$)/i.test(final)) ||
-                       ct.includes("application/gzip") ||
-                       ct.includes("application/x-gzip");
+    const to = withTimeout(within(LIMITS.TIME_SMALL_MS));
+    let r;
+    try {
+      r = await fetch(u, {
+        method: "GET",
+        redirect: "follow",
+        signal: to.signal,
+        headers: BROWSER_HEADERS,   // more “real browser” to bypass WAF picky HEADs
+        cache: "no-store",
+      });
+    } finally {
+      to.done();
     }
-
-    if (sitemapUrl) break;
+    if (r.ok) {
+      const final = r.url || u;     // follow the final URL
+      sitemapUrl = final;
+      const ct = (r.headers.get("content-type") || "").toLowerCase();
+      // one-liners so the line never starts with a regex literal
+      sitemapGzipped =
+        (/\.gz(\?|#|$)/i.test(final)) ||
+        ct.includes("application/gzip") ||
+        ct.includes("application/x-gzip");
+      break;
+    }
   } catch {}
 }
+
 
 
 if (sitemapUrl) {
@@ -1054,6 +1063,7 @@ if (sitemapUrl) {
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
