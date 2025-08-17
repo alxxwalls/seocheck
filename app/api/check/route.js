@@ -136,7 +136,7 @@ export async function GET(req) {
   try {
     const out = await runAudit(req, rawUrl);
     const { _diag, ...copy } = out;
-    cacheSet(key, copy);
+    if (!copy.blocked) cacheSet(key, copy); // ⟵ don’t cache blocked results
     return json(req, 200, { ...copy, _diag });
   } catch (e) {
     const msg =
@@ -169,7 +169,7 @@ export async function POST(req) {
 
     const out = await runAudit(req, rawUrl);
     const { _diag, ...copy } = out;
-    cacheSet(key, copy);
+    if (!copy.blocked) cacheSet(key, copy); // ⟵ don’t cache blocked results
     return json(req, 200, { ...copy, _diag });
   } catch (e) {
     const msg =
@@ -218,7 +218,11 @@ async function retry(fn, { tries = 2, baseDelay = 400 } = {}) {
 
 const tryHeadThenGet = async (
   url,
-  { timeoutMs = LIMITS.TIME_ASSET_MS, redirect = "follow" } = {}
+  {
+    timeoutMs = LIMITS.TIME_ASSET_MS,
+    redirect = "follow",
+    headers = UA_HEADERS, // ⟵ allow custom headers (used in blocked path)
+  } = {}
 ) => {
   return retry(async () => {
     const t1 = withTimeout(timeoutMs);
@@ -227,7 +231,7 @@ const tryHeadThenGet = async (
         method: "HEAD",
         redirect,
         signal: t1.signal,
-        headers: UA_HEADERS,
+        headers,
         cache: "no-store",
       });
       if (r.status === 405 || r.status === 501) throw new Error("HEAD not allowed");
@@ -239,7 +243,7 @@ const tryHeadThenGet = async (
           method: "GET",
           redirect,
           signal: t2.signal,
-          headers: UA_HEADERS,
+          headers,
           cache: "no-store",
         });
       } finally {
@@ -335,10 +339,10 @@ async function runAudit(req, rawUrl) {
     });
 
     if (BLOCK_CODES.has(pageRes.status)) {
-      // Still blocked → return partial, friendly result
+      // Still blocked → return partial, friendly result (enriched)
       const checks = [];
 
-      // robots.txt often accessible even when HTML is blocked
+      // robots.txt (often public)
       try {
         const robotsURL = new URL("/robots.txt", normalizedUrl).toString();
         await timed("robots", async () => {
@@ -353,7 +357,7 @@ async function runAudit(req, rawUrl) {
             checks.push({
               id: "robots",
               label: "robots.txt allows indexing",
-              status: ok ? "warn" : "warn",
+              status: "warn",
               details: ok
                 ? "Accessible (content not parsed due to block)"
                 : "Blocked",
@@ -371,11 +375,58 @@ async function runAudit(req, rawUrl) {
         });
       }
 
-      // Add your locked placeholders so UI shows grey cards
+      // favicon (/favicon.ico best-effort)
+      try {
+        const favUrl = new URL("/favicon.ico", normalizedUrl).toString();
+        const r = await tryHeadThenGet(favUrl, {
+          timeoutMs: LIMITS.TIME_ASSET_MS,
+          headers: BROWSER_HEADERS,
+        });
+        checks.push({
+          id: "favicon",
+          label: "Favicon present & loads",
+          status: isOk(r) ? "pass" : "warn",
+          details: favUrl,
+          value: isOk(r),
+        });
+      } catch {
+        checks.push({
+          id: "favicon",
+          label: "Favicon present & loads",
+          status: "warn",
+          details: "Blocked",
+        });
+      }
+
+      // sitemap (HEAD common paths)
+      let sitemapFound = null;
+      for (const p of ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml"]) {
+        try {
+          const u = new URL(p, normalizedUrl).toString();
+          const h = await tryHeadThenGet(u, {
+            timeoutMs: LIMITS.TIME_SMALL_MS,
+            headers: BROWSER_HEADERS,
+          });
+          if (isOk(h)) {
+            sitemapFound = u;
+            break;
+          }
+        } catch {}
+      }
+      checks.push({
+        id: "sitemap",
+        label: "Sitemap exists & URLs valid",
+        status: sitemapFound ? "warn" : "fail",
+        details: sitemapFound
+          ? `Found: ${sitemapFound} (content not parsed due to block)`
+          : "No sitemap found",
+      });
+
+      // Add locked placeholders so UI still shows grey cards
       for (const id of OMIT_CHECKS) checks.push(LOCK_PLACEHOLDER(id));
       for (const id of ["h1-structure", "llms"]) checks.push(LOCK_PLACEHOLDER(id));
 
-      // Explicit blocked card
+      // Explicit blocked card (so users understand why)
       checks.push({
         id: "blocked",
         label: "Site is blocking automated requests",
@@ -682,8 +733,8 @@ async function runAudit(req, rawUrl) {
   checks.push({
     id: "ttfb",
     label: "Response time < 1500ms",
-    status: Date.now() - t0 < 1500 ? "pass" : "warn",
-    details: `${Date.now() - t0} ms`,
+    status: timingMs < 1500 ? "pass" : "warn",
+    details: `${timingMs} ms`,
   });
 
   /** -------- Canonical tag (robust-ish) -------- */
