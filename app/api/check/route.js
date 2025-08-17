@@ -767,18 +767,20 @@ for (const u of candidates) {
   if (timeLeft() < 250) break;
   try {
     const h = await tryHeadThenGet(u, {
-    timeoutMs: within(LIMITS.TIME_SMALL_MS),
-    headers: BROWSER_HEADERS,
-  });
-  if (isOk(h) && !sitemapUrl) {
-    const final = h.url || u;        // <- use the final URL after redirects
-    sitemapUrl = final;
-    const ct = (h.headers.get("content-type") || "").toLowerCase();
-    sitemapGzipped =
-      /\.gz(\?|#|$)/i.test(final) ||
-      /application\/gzip|application\/x-gzip/i.test(ct);
-  }
+      timeoutMs: within(LIMITS.TIME_SMALL_MS),
+      headers: BROWSER_HEADERS,
     });
+    if (isOk(h) && !sitemapUrl) {
+      const final = h.url || u; // final URL after redirects
+      sitemapUrl = final;
+      const ct = (h.headers.get("content-type") || "").toLowerCase();
+      // keep on one line (or wrap in parens) to avoid starting a line with a regex
+      sitemapGzipped =
+        (/\.gz(\?|#|$)/i.test(final)) ||
+        (/application\/(?:x-)?gzip/i.test(ct));
+      // alternatively (no regex for content-type):
+      // sitemapGzipped = (/\.gz(\?|#|$)/i.test(final)) || ct.includes("application/gzip") || ct.includes("application/x-gzip");
+    }
     if (sitemapUrl) break;
   } catch {}
 }
@@ -1048,6 +1050,7 @@ if (sitemapUrl) {
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
