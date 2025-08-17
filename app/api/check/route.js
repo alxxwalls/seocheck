@@ -8,6 +8,27 @@ const UA_HEADERS = {
   "accept-language": "en-GB,en;q=0.9",
 };
 
+// More “browser-like” headers for WAF retry
+const BROWSER_HEADERS = {
+  "user-agent":
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+  accept:
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "accept-language": "en-GB,en;q=0.9",
+  "upgrade-insecure-requests": "1",
+  "sec-fetch-site": "none",
+  "sec-fetch-mode": "navigate",
+  "sec-fetch-user": "?1",
+  "sec-fetch-dest": "document",
+  "sec-ch-ua":
+    '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"macOS"',
+  referer: "https://www.google.com/",
+};
+
+const BLOCK_CODES = new Set([401, 403, 429]);
+
 /** ---------- limits / budget ---------- */
 const LIMITS = {
   SITEMAP_SAMPLES: 2,
@@ -68,16 +89,14 @@ export async function OPTIONS(req) {
 }
 
 /** ---------- simple in-memory cache (per process) ---------- */
-const CACHE_TTL_MS = parseInt(process.env.AUDIT_CACHE_TTL_MS || "90000", 10); // 90s default
+const CACHE_TTL_MS = parseInt(process.env.AUDIT_CACHE_TTL_MS || "90000", 10); // 90s
 const CACHE = new Map(); // key -> { payload, createdAt, expiresAt }
 
 function normalizeKey(rawUrl) {
   try {
     const u = new URL(/^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`);
     u.hash = "";
-    // Drop query to avoid cache misses due to UTM etc. Keep path & host.
-    u.search = "";
-    // Normalize trailing slash
+    u.search = ""; // drop utm etc.
     const path = u.pathname.replace(/\/+$/, "/");
     return `${u.origin}${path}`;
   } catch {
@@ -99,9 +118,6 @@ function cacheSet(key, payload) {
 }
 
 /** ---------- GET ---------- */
-// /api/check                      -> { ok:true, ping:"pong" }
-// /api/check?url=...              -> run audit (no preflight)
-// /api/check?url=...&nocache=1    -> bypass cache for this call
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
   const rawUrl = searchParams.get("url");
@@ -113,17 +129,15 @@ export async function GET(req) {
     const hit = cacheGet(key);
     if (hit) {
       const age = Date.now() - hit.createdAt;
-      // Never include _diag from cache (keeps payload lean)
       return json(req, 200, { ...hit.payload, cached: true, cacheAgeMs: age });
     }
   }
 
   try {
     const out = await runAudit(req, rawUrl);
-    // Store a copy without _diag
     const { _diag, ...copy } = out;
     cacheSet(key, copy);
-    return json(req, 200, { ...copy, _diag: out._diag });
+    return json(req, 200, { ...copy, _diag });
   } catch (e) {
     const msg =
       e?.name === "AbortError"
@@ -137,7 +151,6 @@ export async function GET(req) {
 }
 
 /** ---------- POST ---------- */
-// Body: { url, nocache?: boolean }
 export async function POST(req) {
   try {
     const body = await req.json().catch(() => ({}));
@@ -157,7 +170,7 @@ export async function POST(req) {
     const out = await runAudit(req, rawUrl);
     const { _diag, ...copy } = out;
     cacheSet(key, copy);
-    return json(req, 200, { ...copy, _diag: out._diag });
+    return json(req, 200, { ...copy, _diag });
   } catch (e) {
     const msg =
       e?.name === "AbortError"
@@ -245,12 +258,10 @@ const absUrl = (base, href) => {
     return undefined;
   }
 };
-
 const parseTitle = (html) => {
   const m = /<title>([\s\S]*?)<\/title>/i.exec(html);
   return m ? m[1].trim() : "";
 };
-
 const getMetaBy = (html, attr, name) => {
   const re = new RegExp(`<meta[^>]*${attr}=["']${name}["'][^>]*>`, "i");
   const m = re.exec(html);
@@ -287,7 +298,7 @@ async function runAudit(req, rawUrl) {
 
   // MAIN PAGE FETCH
   const t0 = Date.now();
-  const pageRes = await timed("page", () =>
+  let pageRes = await timed("page", () =>
     retry(async () => {
       const to = withTimeout(LIMITS.TIME_PAGE_MS);
       try {
@@ -303,6 +314,129 @@ async function runAudit(req, rawUrl) {
     })
   );
 
+  // ---- Blocked handling (401/403/429) ----
+  if (BLOCK_CODES.has(pageRes.status)) {
+    // Retry once with browser-like headers
+    await timed("blocked-retry", async () => {
+      try {
+        const to2 = withTimeout(6000);
+        try {
+          const r = await fetch(normalizedUrl, {
+            redirect: "follow",
+            signal: to2.signal,
+            headers: BROWSER_HEADERS,
+            cache: "no-store",
+          });
+          pageRes = r;
+        } finally {
+          to2.done();
+        }
+      } catch {}
+    });
+
+    if (BLOCK_CODES.has(pageRes.status)) {
+      // Still blocked → return partial, friendly result
+      const checks = [];
+
+      // robots.txt often accessible even when HTML is blocked
+      try {
+        const robotsURL = new URL("/robots.txt", normalizedUrl).toString();
+        await timed("robots", async () => {
+          const toR = withTimeout(LIMITS.TIME_SMALL_MS);
+          try {
+            const r = await fetch(robotsURL, {
+              signal: toR.signal,
+              headers: BROWSER_HEADERS,
+              cache: "no-store",
+            });
+            const ok = r.ok;
+            checks.push({
+              id: "robots",
+              label: "robots.txt allows indexing",
+              status: ok ? "warn" : "warn",
+              details: ok
+                ? "Accessible (content not parsed due to block)"
+                : "Blocked",
+            });
+          } finally {
+            toR.done();
+          }
+        });
+      } catch {
+        checks.push({
+          id: "robots",
+          label: "robots.txt allows indexing",
+          status: "warn",
+          details: "Blocked",
+        });
+      }
+
+      // Add your locked placeholders so UI shows grey cards
+      for (const id of OMIT_CHECKS) checks.push(LOCK_PLACEHOLDER(id));
+      for (const id of ["h1-structure", "llms"]) checks.push(LOCK_PLACEHOLDER(id));
+
+      // Explicit blocked card
+      checks.push({
+        id: "blocked",
+        label: "Site is blocking automated requests",
+        status: "warn",
+        details: `Received ${pageRes.status} ${
+          pageRes.statusText || ""
+        } from the main page. Some checks were skipped.`,
+      });
+
+      // Optional PSI (Google-side fetch sometimes succeeds)
+      let psi;
+      await timed("psi", async () => {
+        try {
+          const key = process.env.PSI_API_KEY;
+          const u = new URL(
+            "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+          );
+          u.searchParams.set("url", normalizedUrl);
+          u.searchParams.set("strategy", "mobile");
+          if (key) u.searchParams.set("key", key);
+          const to = withTimeout(LIMITS.TIME_PSI_MS);
+          try {
+            const res = await fetch(u.toString(), { signal: to.signal });
+            if (res.ok) {
+              const data = await res.json();
+              const score = data?.lighthouseResult?.categories?.performance?.score;
+              if (typeof score === "number") psi = Math.round(score * 100);
+            }
+          } finally {
+            to.done();
+          }
+        } catch {}
+      });
+      if (typeof psi === "number") {
+        checks.push({
+          id: "psi",
+          label: "PageSpeed (mobile)",
+          status: psi >= 70 ? "pass" : "warn",
+          details: `${psi}/100`,
+          value: psi,
+        });
+      }
+
+      const payload = {
+        ok: true,
+        blocked: true,
+        url: rawUrl,
+        normalizedUrl,
+        finalUrl: normalizedUrl,
+        fetchedStatus: pageRes.status,
+        timingMs: 0,
+        title: "",
+        speed: psi,
+        checks,
+      };
+      if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
+      return payload;
+    }
+  }
+
+  // ---- Normal path (not blocked) ----
   const html = await pageRes.text();
   const timingMs = Date.now() - t0;
   const finalUrl = pageRes.url;
@@ -313,45 +447,6 @@ async function runAudit(req, rawUrl) {
   const host = urlObj.host;
 
   const checks = [];
-
-  // Find <link rel="canonical" ...> allowing spaces and optional quotes
-function findCanonicalHrefInHtml(html) {
-  const linkTags = [...html.matchAll(/<link\b[^>]*>/gi)].map(m => m[0]);
-  // collect all tags whose rel contains canonical
-  const canonicalTags = linkTags.filter(tag =>
-    /\brel\s*=\s*["']?\s*canonical\s*["']?/i.test(tag)
-  );
-  for (const tag of canonicalTags) {
-    const m = tag.match(/\bhref\s*=\s*["']?([^"'\s>]+)["']?/i);
-    if (m) return { href: m[1], count: canonicalTags.length };
-  }
-  return { href: null, count: canonicalTags.length };
-}
-
-// Some sites set canonical via HTTP Link header
-function findCanonicalHrefInHeader(headers) {
-  const link = headers.get("link");
-  if (!link) return null;
-  // split by comma only when followed by a new angled bracket
-  const parts = link.split(/,(?=\s*<)/);
-  for (const part of parts) {
-    if (!/;\s*rel\s*=\s*"?canonical"?/i.test(part)) continue;
-    const m = part.match(/<([^>]+)>/);
-    if (m) return m[1];
-  }
-  return null;
-}
-
-// Normalize two URLs for comparison (strip search/hash, normalize host case and trailing slash)
-function normalizeForCompare(u) {
-  const x = new URL(u);
-  x.hash = "";
-  x.search = "";
-  x.hostname = x.hostname.toLowerCase();
-  // remove trailing slash except for the root
-  if (x.pathname !== "/") x.pathname = x.pathname.replace(/\/+$/, "");
-  return x.toString();
-}
 
   /** -------- Open Graph -------- */
   const ogTitle = getMetaProp(html, "og:title");
@@ -406,7 +501,7 @@ function normalizeForCompare(u) {
     try {
       await timed("favicon", async () => {
         const r = await tryHeadThenGet(faviconUrl, {
-          timeoutMs: LIMITS.TiME_ASSET_MS, // fallback to LIMITS.TIME_ASSET_MS via tryHeadThenGet default
+          timeoutMs: LIMITS.TIME_ASSET_MS,
         });
         faviconLoads = isOk(r);
       });
@@ -467,7 +562,7 @@ function normalizeForCompare(u) {
   let sitemapUrl = null,
     sitemapHasUrls = false,
     sitemapSampleOk = 0;
-  for (const p of ["/sitemap.xml", "/sitemap_index.xml", "/sitemapindex.xml", "/sitemap-index.xml"]) {
+  for (const p of ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml"]) {
     const u = absUrl(origin + "/", p);
     try {
       await timed(`sitemap-head ${p}`, async () => {
@@ -587,44 +682,38 @@ function normalizeForCompare(u) {
   checks.push({
     id: "ttfb",
     label: "Response time < 1500ms",
-    status: timingMs < 1500 ? "pass" : "warn",
-    details: `${timingMs} ms`,
+    status: Date.now() - t0 < 1500 ? "pass" : "warn",
+    details: `${Date.now() - t0} ms`,
   });
 
- /** -------- Canonical tag (robust) -------- */
-let canonicalHref;      // absolute URL (if found)
-let canonicalOk;        // boolean | undefined
-let multipleCanon = false;
-
-// 1) Try HTML
-const { href: canonRaw, count: canonCount } = findCanonicalHrefInHtml(html);
-multipleCanon = (canonCount || 0) > 1;
-
-// 2) Fallback: HTTP Link header
-const headerCanon = findCanonicalHrefInHeader(pageRes.headers);
-
-// Pick first available
-const picked = canonRaw || headerCanon;
-if (picked) {
-  canonicalHref = absUrl(finalUrl, picked); // resolve relative to page
-  try {
-    const a = normalizeForCompare(canonicalHref);
-    const b = normalizeForCompare(finalUrl);
-    canonicalOk = a === b;
-  } catch {
-    canonicalOk = undefined;
+  /** -------- Canonical tag (robust-ish) -------- */
+  const canonTags = [...html.matchAll(/<link\b[^>]*>/gi)]
+    .map((m) => m[0])
+    .filter((tag) => /\brel\s*=\s*["']?\s*canonical\s*["']?/i.test(tag));
+  let canonicalHref,
+    canonicalOk,
+    multipleCanon = canonTags.length > 1;
+  if (canonTags.length) {
+    const hrefm = canonTags[0].match(/\bhref\s*=\s*["']?([^"'\s>]+)["']?/i);
+    canonicalHref = hrefm ? absUrl(finalUrl, hrefm[1]) : undefined;
+    try {
+      const a = new URL(canonicalHref);
+      const b = new URL(finalUrl);
+      a.hash = ""; a.search = ""; a.hostname = a.hostname.toLowerCase();
+      b.hash = ""; b.search = ""; b.hostname = b.hostname.toLowerCase();
+      if (a.pathname !== "/") a.pathname = a.pathname.replace(/\/+$/, "");
+      if (b.pathname !== "/") b.pathname = b.pathname.replace(/\/+$/, "");
+      canonicalOk = a.toString() === b.toString();
+    } catch { canonicalOk = undefined; }
   }
-}
-
-checks.push({
-  id: "canonical",
-  label: "Canonical tag",
-  status: canonicalHref ? (canonicalOk && !multipleCanon ? "pass" : "warn") : "fail",
-  details: canonicalHref
-    ? `${canonicalOk ? "Matches URL" : `Points to ${canonicalHref}`}${multipleCanon ? " • multiple canonicals" : ""}`
-    : "Missing",
-});
-
+  checks.push({
+    id: "canonical",
+    label: "Canonical tag",
+    status: canonicalHref ? (canonicalOk && !multipleCanon ? "pass" : "warn") : "fail",
+    details: canonicalHref
+      ? `${canonicalOk ? "Matches URL" : `Points to ${canonicalHref}`}${multipleCanon ? " • multiple canonicals" : ""}`
+      : "Missing",
+  });
 
   /** -------- Meta robots & X-Robots-Tag -------- */
   const robotsMetaVal = getMetaName(html, "robots")?.toLowerCase() || "";
@@ -777,5 +866,3 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
-
-
