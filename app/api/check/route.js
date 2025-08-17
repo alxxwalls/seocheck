@@ -265,26 +265,7 @@ async function runAudit(req, rawUrl) {
       details: statusText,
     });
 
-    // robots.txt (best-effort)
-    try {
-      const robotsURL = new URL("/robots.txt", normalizedUrl).toString();
-      await timed("robots-timeout", async () => {
-        const toR = withTimeout(within(LIMITS.TIME_SMALL_MS));
-        try {
-          const r = await fetch(robotsURL, { signal: toR.signal, headers: BROWSER_HEADERS, cache: "no-store" });
-          checks.push({
-            id: "robots",
-            label: "robots.txt allows indexing",
-            status: "warn",
-            details: r.ok ? "Accessible (content not parsed due to timeout)" : "Unavailable",
-          });
-        } finally { toR.done(); }
-      });
-    } catch {
-      checks.push({ id: "robots", label: "robots.txt allows indexing", status: "warn", details: "Unavailable" });
-    }
-
-    // favicon
+   // favicon
     try {
       const favUrl = new URL("/favicon.ico", normalizedUrl).toString();
       const r = await tryHeadThenGet(favUrl, { timeoutMs: within(LIMITS.TIME_ASSET_MS), headers: BROWSER_HEADERS });
@@ -293,22 +274,97 @@ async function runAudit(req, rawUrl) {
       checks.push({ id: "favicon", label: "Favicon present & loads", status: "warn", details: "Unknown" });
     }
 
-    // sitemap (HEAD only)
-    let sitemapFound = null;
-    for (const p of ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml"]) {
-      if (timeLeft() < 300) break;
-      try {
-        const u = new URL(p, normalizedUrl).toString();
-        const h = await tryHeadThenGet(u, { timeoutMs: within(LIMITS.TIME_SMALL_MS), headers: BROWSER_HEADERS });
-        if (isOk(h)) { sitemapFound = u; break; }
-      } catch {}
+   // robots.txt (best-effort + capture Sitemap: URLs + quick allow check)
+let robotsSitemaps = [];           // <-- make sure this is in scope for the sitemap probe below
+try {
+  // Always resolve from the site origin, not the deep page
+  const origin = (() => { try { return new URL(normalizedUrl).origin; } catch { return normalizedUrl; } })();
+  const robotsURL = new URL("/robots.txt", origin).toString();
+
+  await timed("robots-timeout", async () => {
+    const toR = withTimeout(within(LIMITS.TIME_SMALL_MS));
+    try {
+      const r = await fetch(robotsURL, {
+        signal: toR.signal,
+        headers: BROWSER_HEADERS,
+        cache: "no-store",
+      });
+
+      if (r.ok) {
+        const txt = await r.text();
+
+        // Collect all explicit Sitemap: URLs (absolute them against robots location)
+        const matches = [...txt.matchAll(/^\s*Sitemap:\s*(\S+)\s*$/gim)];
+        robotsSitemaps = matches
+          .map((m) => absUrl(robotsURL, m[1]))
+          .filter(Boolean);
+
+        // Quick “is everything disallowed for * ?”
+        const blocks = txt.split(/(?=^User-agent:\s*)/gim);
+        const star = blocks.find((b) => /^User-agent:\s*\*/im.test(b)) || "";
+        const disallowAll = /^\s*Disallow:\s*\/\s*$/im.test(star);
+
+        checks.push({
+          id: "robots",
+          label: "robots.txt allows indexing",
+          status: disallowAll ? "fail" : "warn",
+          details:
+            (disallowAll ? "User-agent: * disallows /" : "Accessible") +
+            (robotsSitemaps.length ? ` • ${robotsSitemaps.length} sitemap URL(s) listed` : ""),
+        });
+      } else {
+        checks.push({
+          id: "robots",
+          label: "robots.txt allows indexing",
+          status: "warn",
+          details: `Unavailable (HTTP ${r.status})`,
+        });
+      }
+    } finally {
+      toR.done();
     }
-    checks.push({
-      id: "sitemap",
-      label: "Sitemap exists & URLs valid",
-      status: sitemapFound ? "warn" : "fail",
-      details: sitemapFound ? `Found: ${sitemapFound} (content not parsed due to timeout)` : "No sitemap found",
+  });
+} catch {
+  checks.push({
+    id: "robots",
+    label: "robots.txt allows indexing",
+    status: "warn",
+    details: "Unavailable",
+  });
+}
+
+// Sitemap (HEAD only; common paths + robots.txt advertised URLs)
+const origin = (() => { try { return new URL(normalizedUrl).origin; } catch { return normalizedUrl; } })();
+
+let sitemapFound = null;
+const candidates = new Set([
+  new URL("/sitemap.xml", origin).toString(),
+  new URL("/sitemap_index.xml", origin).toString(),
+  new URL("/sitemap-index.xml", origin).toString(),
+  new URL("/wp-sitemap.xml", origin).toString(),   // WordPress core
+  ...(robotsSitemaps || []),
+]);
+
+for (const u of candidates) {
+  if (timeLeft && timeLeft() < 300) break;
+  try {
+    const h = await tryHeadThenGet(u, {
+      timeoutMs: within ? within(LIMITS.TIME_SMALL_MS) : LIMITS.TIME_SMALL_MS,
+      headers: BROWSER_HEADERS,
     });
+    if (isOk(h)) { sitemapFound = u; break; }
+  } catch {}
+}
+
+checks.push({
+  id: "sitemap",
+  label: "Sitemap exists & URLs valid",
+  status: sitemapFound ? "warn" : "fail",
+  details: sitemapFound
+    ? `Found: ${sitemapFound} (content not parsed in this fast path)`
+    : "No sitemap found at common paths or in robots.txt",
+});
+   
 
     // placeholders
     for (const id of OMIT_CHECKS) checks.push(LOCK_PLACEHOLDER(id));
@@ -827,5 +883,6 @@ if (sitemapUrl) {
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
