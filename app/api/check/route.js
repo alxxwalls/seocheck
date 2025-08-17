@@ -613,7 +613,7 @@ async function runAudit(req, rawUrl) {
   let sitemapUrl = null,
     sitemapHasUrls = false,
     sitemapSampleOk = 0;
-  for (const p of ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml"]) {
+  for (const p of ["/sitemap.xml", "/sitemap_index.xml", "/sitemapindex.xml", "/sitemap-index.xml"]) {
     const u = absUrl(origin + "/", p);
     try {
       await timed(`sitemap-head ${p}`, async () => {
@@ -917,3 +917,4 @@ async function runAudit(req, rawUrl) {
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
