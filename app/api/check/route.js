@@ -573,9 +573,10 @@ for (const u of candidates) {
       timeoutMs: within(LIMITS.TIME_SMALL_MS),
       headers: BROWSER_HEADERS,
     });
-    if (isOk(h)) { sitemapFound = u; break; }
+    if (isOk(h)) { sitemapFound = h.url || u; break; } // <- final URL
   } catch {}
 }
+
 checks.push({
   id: "sitemap",
   label: "Sitemap exists & URLs valid",
@@ -769,21 +770,24 @@ for (const u of candidates) {
     const h = await tryHeadThenGet(u, {
       timeoutMs: within(LIMITS.TIME_SMALL_MS),
       headers: BROWSER_HEADERS,
+      // fallbackOnNonOk true by default, so 301/302/405 will retry with GET
     });
+
     if (isOk(h) && !sitemapUrl) {
-      const final = h.url || u; // final URL after redirects
+      const final = h.url || u; // follow final URL after redirects
       sitemapUrl = final;
+
       const ct = (h.headers.get("content-type") || "").toLowerCase();
-      // keep on one line (or wrap in parens) to avoid starting a line with a regex
-      sitemapGzipped =
-        (/\.gz(\?|#|$)/i.test(final)) ||
-        (/application\/(?:x-)?gzip/i.test(ct));
-      // alternatively (no regex for content-type):
-      // sitemapGzipped = (/\.gz(\?|#|$)/i.test(final)) || ct.includes("application/gzip") || ct.includes("application/x-gzip");
+      // keep on one line so the line doesn't begin with a regex literal
+      sitemapGzipped = (/\.gz(\?|#|$)/i.test(final)) ||
+                       ct.includes("application/gzip") ||
+                       ct.includes("application/x-gzip");
     }
+
     if (sitemapUrl) break;
   } catch {}
 }
+
 
 if (sitemapUrl) {
   // If gzipped, don’t try to parse (Edge runtime lacks Node zlib); just report found.
@@ -1050,6 +1054,7 @@ if (sitemapUrl) {
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
