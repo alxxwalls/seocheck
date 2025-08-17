@@ -514,7 +514,7 @@ async function runAudit(req, rawUrl) {
     details: httpCode ? `${httpCode} → ${httpLoc || "(no location)"}` : "Not applicable",
   });
 
-  /** -------- Security headers -------- 
+  /** -------- Security headers -------- */
   const h = pageRes.headers;
   const sec = {
     csp: !!h.get("content-security-policy"),
@@ -529,7 +529,7 @@ async function runAudit(req, rawUrl) {
     label: "Security headers",
     status: have >= 4 ? "pass" : have >= 2 ? "warn" : "fail",
     details: `CSP=${sec.csp} XFO=${sec.xfo} XCTO=${sec.xcto} Referrer-Policy=${sec.ref} HSTS=${sec.hsts}`,
-  }); */
+  });
 
   /** -------- Images: alt, format, size, lazy -------- */
   const imgTags = [...html.matchAll(/<img[^>]*>/gi)].map((m) => m[0]).slice(0, 40);
@@ -589,7 +589,7 @@ async function runAudit(req, rawUrl) {
     details: `${lazyCount} images with loading="lazy"`,
   });
 
-  /** -------- Mixed content (on HTTPS) -------- 
+  /** -------- Mixed content (on HTTPS) -------- */
   let mixed = 0;
   if (finalUrl.startsWith("https://")) {
     const httpRefs = [...html.matchAll(/\s(?:src|href)=["']http:\/\/[^"']+["']/gi)];
@@ -600,9 +600,9 @@ async function runAudit(req, rawUrl) {
     label: "No mixed content",
     status: mixed === 0 ? "pass" : mixed <= 3 ? "warn" : "fail",
     details: mixed ? `${mixed} http:// references` : "None detected",
-  }); */
+  });
 
-  /** -------- Structured data presence -------- 
+  /** -------- Structured data presence -------- */
   const jsonLdBlocks = [
     ...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi),
   ]
@@ -621,7 +621,7 @@ async function runAudit(req, rawUrl) {
     label: "Structured data (JSON-LD)",
     status: ldTypes.length ? "pass" : "warn",
     details: ldTypes.length ? `Types: ${Array.from(new Set(ldTypes)).join(", ").slice(0, 120)}` : "No JSON-LD found",
-  });*/
+  });
 
   /** -------- Compression -------- */
   const enc = pageRes.headers.get("content-encoding") || "";
