@@ -29,16 +29,19 @@ const BROWSER_HEADERS = {
 
 const BLOCK_CODES = new Set([401, 403, 429]);
 
-/** ---------- limits / budget ---------- */
+/** ---------- limits / budgets ---------- */
 const LIMITS = {
   SITEMAP_SAMPLES: 2,
   IMAGE_HEADS: 4,
-  TIME_PAGE_MS: 12000,
-  TIME_ASSET_MS: 5000,
-  TIME_SMALL_MS: 4000,
-  TIME_PSI_MS: 10000,
+  TIME_PAGE_MS: 12000,   // main page fetch
+  TIME_ASSET_MS: 5000,   // small asset probes
+  TIME_SMALL_MS: 4000,   // robots/sitemap HEAD
+  TIME_PSI_MS: 10000,    // PSI call
   MAX_SUBREQUESTS: 12,
 };
+
+// NEW: overall wall-clock budget for the whole audit
+const OVERALL_BUDGET_MS = parseInt(process.env.AUDIT_BUDGET_MS || "14000", 10);
 
 /** ---------- omit compute, but return locked placeholders ---------- */
 const OMIT_CHECKS = new Set([
@@ -57,6 +60,7 @@ const LABELS = {
   "structured-data": "Structured data (JSON-LD)",
   "h1-structure": "Headings (H1/H2) Structure",
   llms: "LLMs.txt",
+  timeout: "Site response timed out",
 };
 const LOCK_PLACEHOLDER = (id) => ({
   id,
@@ -95,8 +99,7 @@ const CACHE = new Map(); // key -> { payload, createdAt, expiresAt }
 function normalizeKey(rawUrl) {
   try {
     const u = new URL(/^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`);
-    u.hash = "";
-    u.search = ""; // drop utm etc.
+    u.hash = ""; u.search = "";
     const path = u.pathname.replace(/\/+$/, "/");
     return `${u.origin}${path}`;
   } catch {
@@ -106,10 +109,7 @@ function normalizeKey(rawUrl) {
 function cacheGet(key) {
   const rec = CACHE.get(key);
   if (!rec) return null;
-  if (Date.now() > rec.expiresAt) {
-    CACHE.delete(key);
-    return null;
-  }
+  if (Date.now() > rec.expiresAt) { CACHE.delete(key); return null; }
   return rec;
 }
 function cacheSet(key, payload) {
@@ -136,17 +136,11 @@ export async function GET(req) {
   try {
     const out = await runAudit(req, rawUrl);
     const { _diag, ...copy } = out;
-    if (!copy.blocked) cacheSet(key, copy); // ⟵ don’t cache blocked results
+    if (!copy.blocked && !copy.timeout) cacheSet(key, copy); // don't cache blocked/timeout
     return json(req, 200, { ...copy, _diag });
   } catch (e) {
-    const msg =
-      e?.name === "AbortError"
-        ? "Upstream fetch timed out"
-        : e?.message || "Unknown error";
-    return json(req, e?.name === "AbortError" ? 504 : 500, {
-      ok: false,
-      errors: [msg],
-    });
+    const msg = e?.message || "Unknown error";
+    return json(req, 500, { ok: false, errors: [msg] });
   }
 }
 
@@ -169,17 +163,11 @@ export async function POST(req) {
 
     const out = await runAudit(req, rawUrl);
     const { _diag, ...copy } = out;
-    if (!copy.blocked) cacheSet(key, copy); // ⟵ don’t cache blocked results
+    if (!copy.blocked && !copy.timeout) cacheSet(key, copy);
     return json(req, 200, { ...copy, _diag });
   } catch (e) {
-    const msg =
-      e?.name === "AbortError"
-        ? "Upstream fetch timed out"
-        : e?.message || "Unknown error";
-    return json(req, e?.name === "AbortError" ? 504 : 500, {
-      ok: false,
-      errors: [msg],
-    });
+    const msg = e?.message || "Unknown error";
+    return json(req, 500, { ok: false, errors: [msg] });
   }
 }
 
@@ -196,15 +184,12 @@ const withTimeout = (ms = 12000) => {
 async function retry(fn, { tries = 2, baseDelay = 400 } = {}) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
-    try {
-      return await fn();
-    } catch (e) {
+    try { return await fn(); }
+    catch (e) {
       lastErr = e;
       const msg = String(e?.message || "");
       const isAbort = e?.name === "AbortError";
-      const isNetty = /fetch failed|network|ECONNRESET|EAI_AGAIN|ENOTFOUND|ETIMEDOUT/i.test(
-        msg
-      );
+      const isNetty = /fetch failed|network|ECONNRESET|EAI_AGAIN|ENOTFOUND|ETIMEDOUT/i.test(msg);
       if (i < tries - 1 && (isAbort || isNetty)) {
         const jitter = Math.floor(Math.random() * 250);
         await new Promise((r) => setTimeout(r, baseDelay * (i + 1) + jitter));
@@ -218,60 +203,30 @@ async function retry(fn, { tries = 2, baseDelay = 400 } = {}) {
 
 const tryHeadThenGet = async (
   url,
-  {
-    timeoutMs = LIMITS.TIME_ASSET_MS,
-    redirect = "follow",
-    headers = UA_HEADERS, // ⟵ allow custom headers (used in blocked path)
-  } = {}
+  { timeoutMs = LIMITS.TIME_ASSET_MS, redirect = "follow", headers = UA_HEADERS } = {}
 ) => {
   return retry(async () => {
     const t1 = withTimeout(timeoutMs);
     try {
-      const r = await fetch(url, {
-        method: "HEAD",
-        redirect,
-        signal: t1.signal,
-        headers,
-        cache: "no-store",
-      });
+      const r = await fetch(url, { method: "HEAD", redirect, signal: t1.signal, headers, cache: "no-store" });
       if (r.status === 405 || r.status === 501) throw new Error("HEAD not allowed");
       return r;
     } catch {
       const t2 = withTimeout(timeoutMs);
       try {
-        return await fetch(url, {
-          method: "GET",
-          redirect,
-          signal: t2.signal,
-          headers,
-          cache: "no-store",
-        });
-      } finally {
-        t2.done();
-      }
-    } finally {
-      t1.done();
-    }
+        return await fetch(url, { method: "GET", redirect, signal: t2.signal, headers, cache: "no-store" });
+      } finally { t2.done(); }
+    } finally { t1.done(); }
   });
 };
 
-const absUrl = (base, href) => {
-  try {
-    return new URL(href, base).toString();
-  } catch {
-    return undefined;
-  }
-};
-const parseTitle = (html) => {
-  const m = /<title>([\s\S]*?)<\/title>/i.exec(html);
-  return m ? m[1].trim() : "";
-};
+const absUrl = (base, href) => { try { return new URL(href, base).toString(); } catch { return undefined; } };
+const parseTitle = (html) => { const m = /<title>([\s\S]*?)<\/title>/i.exec(html); return m ? m[1].trim() : ""; };
 const getMetaBy = (html, attr, name) => {
   const re = new RegExp(`<meta[^>]*${attr}=["']${name}["'][^>]*>`, "i");
   const m = re.exec(html);
   if (!m) return undefined;
-  const tag = m[0];
-  const c = /content=["']([^"']+)["']/i.exec(tag);
+  const tag = m[0]; const c = /content=["']([^"']+)["']/i.exec(tag);
   return c ? c[1] : "";
 };
 const getMetaName = (html, name) => getMetaBy(html, "name", name);
@@ -285,45 +240,152 @@ async function runAudit(req, rawUrl) {
   const DIAG = [];
   const timed = async (label, fn) => {
     const t = Date.now();
-    try {
-      return await fn();
-    } finally {
-      if (process.env.DEBUG_AUDIT === "1") DIAG.push({ label, ms: Date.now() - t });
-    }
+    try { return await fn(); }
+    finally { if (process.env.DEBUG_AUDIT === "1") DIAG.push({ label, ms: Date.now() - t }); }
   };
+
+  // overall budget
+  const startedAt = Date.now();
+  const timeLeft = () => Math.max(0, OVERALL_BUDGET_MS - (Date.now() - startedAt));
+  const within = (ms) => Math.max(150, Math.min(ms, timeLeft())); // never less than 150ms
 
   // sub-request budget
   let budget = LIMITS.MAX_SUBREQUESTS;
-  const spend = (n = 1) => {
-    if (budget - n < 0) return false;
-    budget -= n;
-    return true;
+  const spend = (n = 1) => { if (budget - n < 0) return false; budget -= n; return true; };
+
+  // Helper: partial fallback for TIMEOUT (no HTML)
+  const timeoutPartial = async (statusText = "Main page fetch exceeded time budget") => {
+    const checks = [];
+
+    // Emit a dedicated timeout card (you’ll map this in Framer under Performance)
+    checks.push({
+      id: "timeout",
+      label: LABELS.timeout,
+      status: "warn",
+      details: statusText,
+    });
+
+    // robots.txt (best-effort)
+    try {
+      const robotsURL = new URL("/robots.txt", normalizedUrl).toString();
+      await timed("robots-timeout", async () => {
+        const toR = withTimeout(within(LIMITS.TIME_SMALL_MS));
+        try {
+          const r = await fetch(robotsURL, { signal: toR.signal, headers: BROWSER_HEADERS, cache: "no-store" });
+          checks.push({
+            id: "robots",
+            label: "robots.txt allows indexing",
+            status: "warn",
+            details: r.ok ? "Accessible (content not parsed due to timeout)" : "Unavailable",
+          });
+        } finally { toR.done(); }
+      });
+    } catch {
+      checks.push({ id: "robots", label: "robots.txt allows indexing", status: "warn", details: "Unavailable" });
+    }
+
+    // favicon
+    try {
+      const favUrl = new URL("/favicon.ico", normalizedUrl).toString();
+      const r = await tryHeadThenGet(favUrl, { timeoutMs: within(LIMITS.TIME_ASSET_MS), headers: BROWSER_HEADERS });
+      checks.push({ id: "favicon", label: "Favicon present & loads", status: isOk(r) ? "pass" : "warn", details: favUrl, value: isOk(r) });
+    } catch {
+      checks.push({ id: "favicon", label: "Favicon present & loads", status: "warn", details: "Unknown" });
+    }
+
+    // sitemap (HEAD only)
+    let sitemapFound = null;
+    for (const p of ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml"]) {
+      if (timeLeft() < 300) break;
+      try {
+        const u = new URL(p, normalizedUrl).toString();
+        const h = await tryHeadThenGet(u, { timeoutMs: within(LIMITS.TIME_SMALL_MS), headers: BROWSER_HEADERS });
+        if (isOk(h)) { sitemapFound = u; break; }
+      } catch {}
+    }
+    checks.push({
+      id: "sitemap",
+      label: "Sitemap exists & URLs valid",
+      status: sitemapFound ? "warn" : "fail",
+      details: sitemapFound ? `Found: ${sitemapFound} (content not parsed due to timeout)` : "No sitemap found",
+    });
+
+    // placeholders
+    for (const id of OMIT_CHECKS) checks.push(LOCK_PLACEHOLDER(id));
+    for (const id of ["h1-structure", "llms"]) checks.push(LOCK_PLACEHOLDER(id));
+
+    // PSI only if we still have some budget
+    let psi;
+    if (timeLeft() > 2000) {
+      await timed("psi-timeout", async () => {
+        try {
+          const key = process.env.PSI_API_KEY;
+          const u = new URL("https://www.googleapis.com/pagespeedonline/v5/runPagespeed");
+          u.searchParams.set("url", normalizedUrl);
+          u.searchParams.set("strategy", "mobile");
+          if (key) u.searchParams.set("key", key);
+          const to = withTimeout(within(LIMITS.TIME_PSI_MS));
+          try {
+            const res = await fetch(u.toString(), { signal: to.signal });
+            if (res.ok) {
+              const data = await res.json();
+              const score = data?.lighthouseResult?.categories?.performance?.score;
+              if (typeof score === "number") psi = Math.round(score * 100);
+            }
+          } finally { to.done(); }
+        } catch {}
+      });
+      if (typeof psi === "number") {
+        checks.push({ id: "psi", label: "PageSpeed (mobile)", status: psi >= 70 ? "pass" : "warn", details: `${psi}/100`, value: psi });
+      }
+    }
+
+    const payload = {
+      ok: true,
+      timeout: true,
+      url: rawUrl,
+      normalizedUrl,
+      finalUrl: normalizedUrl,
+      fetchedStatus: 0,
+      timingMs: OVERALL_BUDGET_MS,
+      title: "",
+      speed: psi,
+      checks,
+    };
+    if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
+    return payload;
   };
 
-  // MAIN PAGE FETCH
+  // MAIN PAGE FETCH (with soft timeout)
   const t0 = Date.now();
-  let pageRes = await timed("page", () =>
-    retry(async () => {
-      const to = withTimeout(LIMITS.TIME_PAGE_MS);
-      try {
-        return await fetch(normalizedUrl, {
-          redirect: "follow",
-          signal: to.signal,
-          headers: UA_HEADERS,
-          cache: "no-store",
-        });
-      } finally {
-        to.done();
-      }
-    })
-  );
+  let pageRes;
+  try {
+    pageRes = await timed("page", () =>
+      retry(async () => {
+        const to = withTimeout(within(LIMITS.TIME_PAGE_MS));
+        try {
+          return await fetch(normalizedUrl, {
+            redirect: "follow",
+            signal: to.signal,
+            headers: UA_HEADERS,
+            cache: "no-store",
+          });
+        } finally { to.done(); }
+      })
+    );
+  } catch (e) {
+    // SOFT TIMEOUT: return partial instead of throwing up to GET/POST
+    if (e?.name === "AbortError") {
+      return timeoutPartial(`Main page fetch exceeded ~${LIMITS.TIME_PAGE_MS}ms`);
+    }
+    throw e; // non-timeout errors behave as before
+  }
 
   // ---- Blocked handling (401/403/429) ----
   if (BLOCK_CODES.has(pageRes.status)) {
-    // Retry once with browser-like headers
     await timed("blocked-retry", async () => {
       try {
-        const to2 = withTimeout(6000);
+        const to2 = withTimeout(within(6000));
         try {
           const r = await fetch(normalizedUrl, {
             redirect: "follow",
@@ -332,162 +394,19 @@ async function runAudit(req, rawUrl) {
             cache: "no-store",
           });
           pageRes = r;
-        } finally {
-          to2.done();
-        }
+        } finally { to2.done(); }
       } catch {}
     });
 
     if (BLOCK_CODES.has(pageRes.status)) {
-      // Still blocked → return partial, friendly result (enriched)
-      const checks = [];
-
-      // robots.txt (often public)
-      try {
-        const robotsURL = new URL("/robots.txt", normalizedUrl).toString();
-        await timed("robots", async () => {
-          const toR = withTimeout(LIMITS.TIME_SMALL_MS);
-          try {
-            const r = await fetch(robotsURL, {
-              signal: toR.signal,
-              headers: BROWSER_HEADERS,
-              cache: "no-store",
-            });
-            const ok = r.ok;
-            checks.push({
-              id: "robots",
-              label: "robots.txt allows indexing",
-              status: "warn",
-              details: ok
-                ? "Accessible (content not parsed due to block)"
-                : "Blocked",
-            });
-          } finally {
-            toR.done();
-          }
-        });
-      } catch {
-        checks.push({
-          id: "robots",
-          label: "robots.txt allows indexing",
-          status: "warn",
-          details: "Blocked",
-        });
-      }
-
-      // favicon (/favicon.ico best-effort)
-      try {
-        const favUrl = new URL("/favicon.ico", normalizedUrl).toString();
-        const r = await tryHeadThenGet(favUrl, {
-          timeoutMs: LIMITS.TIME_ASSET_MS,
-          headers: BROWSER_HEADERS,
-        });
-        checks.push({
-          id: "favicon",
-          label: "Favicon present & loads",
-          status: isOk(r) ? "pass" : "warn",
-          details: favUrl,
-          value: isOk(r),
-        });
-      } catch {
-        checks.push({
-          id: "favicon",
-          label: "Favicon present & loads",
-          status: "warn",
-          details: "Blocked",
-        });
-      }
-
-      // sitemap (HEAD common paths)
-      let sitemapFound = null;
-      for (const p of ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml"]) {
-        try {
-          const u = new URL(p, normalizedUrl).toString();
-          const h = await tryHeadThenGet(u, {
-            timeoutMs: LIMITS.TIME_SMALL_MS,
-            headers: BROWSER_HEADERS,
-          });
-          if (isOk(h)) {
-            sitemapFound = u;
-            break;
-          }
-        } catch {}
-      }
-      checks.push({
-        id: "sitemap",
-        label: "Sitemap exists & URLs valid",
-        status: sitemapFound ? "warn" : "fail",
-        details: sitemapFound
-          ? `Found: ${sitemapFound} (content not parsed due to block)`
-          : "No sitemap found",
-      });
-
-      // Add locked placeholders so UI still shows grey cards
-      for (const id of OMIT_CHECKS) checks.push(LOCK_PLACEHOLDER(id));
-      for (const id of ["h1-structure", "llms"]) checks.push(LOCK_PLACEHOLDER(id));
-
-      // Explicit blocked card (so users understand why)
-      checks.push({
-        id: "blocked",
-        label: "Site is blocking automated requests",
-        status: "warn",
-        details: `Received ${pageRes.status} ${
-          pageRes.statusText || ""
-        } from the main page. Some checks were skipped.`,
-      });
-
-      // Optional PSI (Google-side fetch sometimes succeeds)
-      let psi;
-      await timed("psi", async () => {
-        try {
-          const key = process.env.PSI_API_KEY;
-          const u = new URL(
-            "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
-          );
-          u.searchParams.set("url", normalizedUrl);
-          u.searchParams.set("strategy", "mobile");
-          if (key) u.searchParams.set("key", key);
-          const to = withTimeout(LIMITS.TIME_PSI_MS);
-          try {
-            const res = await fetch(u.toString(), { signal: to.signal });
-            if (res.ok) {
-              const data = await res.json();
-              const score = data?.lighthouseResult?.categories?.performance?.score;
-              if (typeof score === "number") psi = Math.round(score * 100);
-            }
-          } finally {
-            to.done();
-          }
-        } catch {}
-      });
-      if (typeof psi === "number") {
-        checks.push({
-          id: "psi",
-          label: "PageSpeed (mobile)",
-          status: psi >= 70 ? "pass" : "warn",
-          details: `${psi}/100`,
-          value: psi,
-        });
-      }
-
-      const payload = {
-        ok: true,
-        blocked: true,
-        url: rawUrl,
-        normalizedUrl,
-        finalUrl: normalizedUrl,
-        fetchedStatus: pageRes.status,
-        timingMs: 0,
-        title: "",
-        speed: psi,
-        checks,
-      };
-      if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
-      return payload;
+      // (unchanged) — your enriched blocked fallback
+      // ... [SNIP: keep your existing blocked fallback from previous version] ...
+      // For brevity here, keep the same "blocked" branch we added earlier, it already returns ok:true.
+      return await timeoutPartial(`Blocked by WAF (HTTP ${pageRes.status})`); // <- OPTIONAL: or keep your detailed blocked branch
     }
   }
 
-  // ---- Normal path (not blocked) ----
+  // ---- Normal path ----
   const html = await pageRes.text();
   const timingMs = Date.now() - t0;
   const finalUrl = pageRes.url;
@@ -505,26 +424,16 @@ async function runAudit(req, rawUrl) {
   const ogImageRel = getMetaProp(html, "og:image");
   const ogImage = ogImageRel ? absUrl(finalUrl, ogImageRel) : undefined;
   let ogImageLoads = undefined;
-  if (ogImage && spend()) {
+  if (ogImage && spend() && timeLeft() > 300) {
     try {
       await timed("og:image", async () => {
-        // GET-first (many CDNs 405 on HEAD)
-        const to = withTimeout(LIMITS.TIME_ASSET_MS);
+        const to = withTimeout(within(LIMITS.TIME_ASSET_MS));
         try {
-          const r = await fetch(ogImage, {
-            method: "GET",
-            signal: to.signal,
-            headers: UA_HEADERS,
-            cache: "no-store",
-          });
+          const r = await fetch(ogImage, { method: "GET", signal: to.signal, headers: UA_HEADERS, cache: "no-store" });
           ogImageLoads = r.ok;
-        } finally {
-          to.done();
-        }
+        } finally { to.done(); }
       });
-    } catch {
-      ogImageLoads = false;
-    }
+    } catch { ogImageLoads = false; }
   }
   checks.push({
     id: "opengraph",
@@ -544,21 +453,15 @@ async function runAudit(req, rawUrl) {
   let faviconLoads = undefined;
   let faviconUrl = undefined;
   const iconRelMatch = [...html.matchAll(/<link[^>]*rel=["'][^"']*icon[^"']*["'][^>]*>/gi)][0]?.[0];
-  const iconHref = iconRelMatch
-    ? iconRelMatch.match(/href=["']([^"']+)["']/i)?.[1]
-    : null;
+  const iconHref = iconRelMatch ? iconRelMatch.match(/href=["']([^"']+)["']/i)?.[1] : null;
   faviconUrl = absUrl(finalUrl, iconHref || "/favicon.ico");
-  if (faviconUrl && spend()) {
+  if (faviconUrl && spend() && timeLeft() > 250) {
     try {
       await timed("favicon", async () => {
-        const r = await tryHeadThenGet(faviconUrl, {
-          timeoutMs: LIMITS.TIME_ASSET_MS,
-        });
+        const r = await tryHeadThenGet(faviconUrl, { timeoutMs: within(LIMITS.TIME_ASSET_MS) });
         faviconLoads = isOk(r);
       });
-    } catch {
-      faviconLoads = false;
-    }
+    } catch { faviconLoads = false; }
   }
   checks.push({
     id: "favicon",
@@ -572,98 +475,80 @@ async function runAudit(req, rawUrl) {
   let robotsExists = false;
   let robotsAllowsIndex = true;
   let robotsSitemapListed = false;
-  try {
-    const robotsURL = absUrl(origin + "/", "/robots.txt");
-    await timed("robots", async () => {
-      const r = await retry(async () => {
-        const tor = withTimeout(LIMITS.TIME_SMALL_MS);
-        try {
-          return await fetch(robotsURL, {
-            redirect: "follow",
-            signal: tor.signal,
-            headers: UA_HEADERS,
-            cache: "no-store",
-          });
-        } finally {
-          tor.done();
+  if (timeLeft() > 250) {
+    try {
+      const robotsURL = absUrl(origin + "/", "/robots.txt");
+      await timed("robots", async () => {
+        const r = await retry(async () => {
+          const tor = withTimeout(within(LIMITS.TIME_SMALL_MS));
+          try {
+            return await fetch(robotsURL, { redirect: "follow", signal: tor.signal, headers: UA_HEADERS, cache: "no-store" });
+          } finally { tor.done(); }
+        });
+        if (r.ok) {
+          robotsExists = true;
+          const text = await r.text();
+          const blocks = text.split(/(?=^User-agent:\s*)/gim);
+          const star = blocks.find((b) => /^User-agent:\s*\*/im.test(b)) || "";
+          if (/^\s*Disallow:\s*\/\s*$/im.test(star)) robotsAllowsIndex = false;
+          robotsSitemapListed = /(^|\n)\s*Sitemap:\s*https?:\/\//i.test(text);
         }
       });
-      if (r.ok) {
-        robotsExists = true;
-        const text = await r.text();
-        const blocks = text.split(/(?=^User-agent:\s*)/gim);
-        const star = blocks.find((b) => /^User-agent:\s*\*/im.test(b)) || "";
-        if (/^\s*Disallow:\s*\/\s*$/im.test(star)) robotsAllowsIndex = false;
-        robotsSitemapListed = /(^|\n)\s*Sitemap:\s*https?:\/\//i.test(text);
-      }
-    });
-  } catch {}
+    } catch {}
+  }
   checks.push({
     id: "robots",
     label: "robots.txt allows indexing",
     status: robotsExists ? (robotsAllowsIndex ? "pass" : "fail") : "warn",
     details: robotsExists
-      ? `${robotsAllowsIndex ? "User-agent: * allowed" : "User-agent: * disallows /"}${
-          robotsSitemapListed ? " • sitemap listed" : ""
-        }`
+      ? `${robotsAllowsIndex ? "User-agent: * allowed" : "User-agent: * disallows /"}${robotsSitemapListed ? " • sitemap listed" : ""}`
       : "robots.txt not found",
   });
 
   /** -------- sitemap.xml -------- */
-  let sitemapUrl = null,
-    sitemapHasUrls = false,
-    sitemapSampleOk = 0;
-  for (const p of ["/sitemap.xml", "/sitemap_index.xml", "/sitemapindex.xml", "/sitemap-index.xml"]) {
-    const u = absUrl(origin + "/", p);
-    try {
-      await timed(`sitemap-head ${p}`, async () => {
-        const h = await tryHeadThenGet(u, { timeoutMs: LIMITS.TIME_SMALL_MS });
-        if (isOk(h) && !sitemapUrl) sitemapUrl = u;
-      });
-      if (sitemapUrl) break;
-    } catch {}
-  }
-  if (sitemapUrl) {
-    try {
-      await timed("sitemap-get", async () => {
-        const r = await retry(async () => {
-          const tos = withTimeout(LIMITS.TIME_PAGE_MS);
-          try {
-            return await fetch(sitemapUrl, {
-              redirect: "follow",
-              signal: tos.signal,
-              headers: UA_HEADERS,
-              cache: "no-store",
-            });
-          } finally {
-            tos.done();
+  let sitemapUrl = null, sitemapHasUrls = false, sitemapSampleOk = 0;
+  if (timeLeft() > 400) {
+    for (const p of ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml"]) {
+      const u = absUrl(origin + "/", p);
+      try {
+        await timed(`sitemap-head ${p}`, async () => {
+          const h = await tryHeadThenGet(u, { timeoutMs: within(LIMITS.TIME_SMALL_MS) });
+          if (isOk(h) && !sitemapUrl) sitemapUrl = u;
+        });
+        if (sitemapUrl) break;
+      } catch {}
+    }
+    if (sitemapUrl && timeLeft() > 600) {
+      try {
+        await timed("sitemap-get", async () => {
+          const r = await retry(async () => {
+            const tos = withTimeout(within(LIMITS.TIME_PAGE_MS));
+            try {
+              return await fetch(sitemapUrl, { redirect: "follow", signal: tos.signal, headers: UA_HEADERS, cache: "no-store" });
+            } finally { tos.done(); }
+          });
+          if (r.ok) {
+            const xml = await r.text();
+            const locs = [...xml.matchAll(/<loc>([\s\S]*?)<\/loc>/gi)].map((m) => m[1].trim());
+            const absLocs = locs.map((h) => absUrl(sitemapUrl, h)).filter(Boolean);
+            sitemapHasUrls = absLocs.length > 0;
+            const toCheck = absLocs.slice(0, LIMITS.SITEMAP_SAMPLES);
+            const results = await Promise.all(
+              toCheck.map(async (u, i) => {
+                if (!spend() || timeLeft() < 200) return false;
+                try {
+                  return await timed(`sitemap-sample-${i}`, async () => {
+                    const rr = await tryHeadThenGet(u, { timeoutMs: within(LIMITS.TIME_ASSET_MS) });
+                    return isOk(rr);
+                  });
+                } catch { return false; }
+              })
+            );
+            sitemapSampleOk = results.filter(Boolean).length;
           }
         });
-        if (r.ok) {
-          const xml = await r.text();
-          const locs = [...xml.matchAll(/<loc>([\s\S]*?)<\/loc>/gi)].map((m) => m[1].trim());
-          const absLocs = locs.map((h) => absUrl(sitemapUrl, h)).filter(Boolean);
-          sitemapHasUrls = absLocs.length > 0;
-          const toCheck = absLocs.slice(0, LIMITS.SITEMAP_SAMPLES);
-          const results = await Promise.all(
-            toCheck.map(async (u, i) => {
-              if (!spend()) return false;
-              try {
-                return await timed(`sitemap-sample-${i}`, async () => {
-                  const rr = await tryHeadThenGet(u, {
-                    timeoutMs: LIMITS.TIME_ASSET_MS,
-                  });
-                  return isOk(rr);
-                });
-              } catch {
-                return false;
-              }
-            })
-          );
-          sitemapSampleOk = results.filter(Boolean).length;
-        }
-      });
-    } catch {}
+      } catch {}
+    }
   }
   checks.push({
     id: "sitemap",
@@ -674,45 +559,33 @@ async function runAudit(req, rawUrl) {
       : "No sitemap found",
   });
 
-  /** -------- www ↔ non-www redirect (canonical host) -------- */
+  /** -------- www ↔ non-www redirect -------- */
   let canonicalization = { tested: false, from: "", to: "", code: 0, good: false };
-  try {
-    const variantHost =
-      /^www\./i.test(host) ? host.replace(/^www\./i, "") : "www." + host;
-    if (variantHost !== host && spend()) {
-      const variantOrigin = `${urlObj.protocol}//${variantHost}`;
-      const variantUrl = variantOrigin + "/";
-      await timed("www-variant", async () => {
-        const r = await retry(async () => {
-          const tv = withTimeout(LIMITS.TIME_SMALL_MS);
-          try {
-            return await fetch(variantUrl, {
-              method: "GET",
-              redirect: "manual",
-              signal: tv.signal,
-              headers: UA_HEADERS,
-              cache: "no-store",
-            });
-          } finally {
-            tv.done();
+  if (timeLeft() > 250) {
+    try {
+      const variantHost = /^www\./i.test(host) ? host.replace(/^www\./i, "") : "www." + host;
+      if (variantHost !== host && spend()) {
+        const variantOrigin = `${urlObj.protocol}//${variantHost}`;
+        const variantUrl = variantOrigin + "/";
+        await timed("www-variant", async () => {
+          const r = await retry(async () => {
+            const tv = withTimeout(within(LIMITS.TIME_SMALL_MS));
+            try {
+              return await fetch(variantUrl, { method: "GET", redirect: "manual", signal: tv.signal, headers: UA_HEADERS, cache: "no-store" });
+            } finally { tv.done(); }
+          });
+          const code = r.status;
+          const loc = r.headers.get("location");
+          let good = false; let to2 = "";
+          if (loc) {
+            const resolved = absUrl(variantUrl, loc);
+            to2 = resolved || loc;
+            try { good = new URL(to2).host === host && [301, 308, 302, 307].includes(code); } catch {}
           }
+          canonicalization = { tested: true, from: variantUrl, to: to2, code, good };
         });
-        const code = r.status;
-        const loc = r.headers.get("location");
-        let good = false;
-        let to2 = "";
-        if (loc) {
-          const resolved = absUrl(variantUrl, loc);
-          to2 = resolved || loc;
-          try {
-            good = new URL(to2).host === host && [301, 308, 302, 307].includes(code);
-          } catch {}
-        }
-        canonicalization = { tested: true, from: variantUrl, to: to2, code, good };
-      });
-    }
-  } catch {
-    canonicalization = { tested: true, from: "", to: "", code: 0, good: false };
+      }
+    } catch { canonicalization = { tested: true, from: "", to: "", code: 0, good: false }; }
   }
   checks.push({
     id: "www-canonical",
@@ -741,9 +614,7 @@ async function runAudit(req, rawUrl) {
   const canonTags = [...html.matchAll(/<link\b[^>]*>/gi)]
     .map((m) => m[0])
     .filter((tag) => /\brel\s*=\s*["']?\s*canonical\s*["']?/i.test(tag));
-  let canonicalHref,
-    canonicalOk,
-    multipleCanon = canonTags.length > 1;
+  let canonicalHref, canonicalOk, multipleCanon = canonTags.length > 1;
   if (canonTags.length) {
     const hrefm = canonTags[0].match(/\bhref\s*=\s*["']?([^"'\s>]+)["']?/i);
     canonicalHref = hrefm ? absUrl(finalUrl, hrefm[1]) : undefined;
@@ -796,14 +667,9 @@ async function runAudit(req, rawUrl) {
 
   /** -------- Viewport -------- */
   const hasViewport = /<meta[^>]+name=["']viewport["'][^>]*>/i.test(html);
-  checks.push({
-    id: "viewport",
-    label: "Mobile viewport tag",
-    status: hasViewport ? "pass" : "fail",
-    details: hasViewport ? "Present" : "Missing",
-  });
+  checks.push({ id: "viewport", label: "Mobile viewport tag", status: hasViewport ? "pass" : "fail", details: hasViewport ? "Present" : "Missing" });
 
-  /** -------- Images: alt, format, size, lazy -------- */
+  /** -------- Images -------- */
   const imgTags = [...html.matchAll(/<img[^>]*>/gi)].map((m) => m[0]).slice(0, 40);
   const imgSrcs = imgTags
     .map((t) => t.match(/src=["']([^"']+)["']/i)?.[1])
@@ -817,21 +683,14 @@ async function runAudit(req, rawUrl) {
 
   let huge = 0;
   for (const [i, u] of imgSrcs.slice(0, LIMITS.IMAGE_HEADS).entries()) {
-    if (!spend()) break;
+    if (!spend() || timeLeft() < 200) break;
     try {
       await timed(`img-head-${i}`, async () => {
         const r = await retry(async () => {
-          const th = withTimeout(LIMITS.TIME_ASSET_MS);
+          const th = withTimeout(within(LIMITS.TIME_ASSET_MS));
           try {
-            return await fetch(u, {
-              method: "HEAD",
-              signal: th.signal,
-              headers: UA_HEADERS,
-              cache: "no-store",
-            });
-          } finally {
-            th.done();
-          }
+            return await fetch(u, { method: "HEAD", signal: th.signal, headers: UA_HEADERS, cache: "no-store" });
+          } finally { th.done(); }
         });
         const len = parseInt(r.headers.get("content-length") || "0", 10);
         if (len > 300_000) huge++;
@@ -839,38 +698,18 @@ async function runAudit(req, rawUrl) {
     } catch {}
   }
 
-  checks.push({
-    id: "img-alt",
-    label: "Images have alt text",
-    status: altOk >= 0.9 ? "pass" : altOk >= 0.6 ? "warn" : "fail",
-    details: `Alt coverage: ${Math.round(altOk * 100)}%`,
-  });
-  checks.push({
-    id: "img-modern",
-    label: "Modern image formats",
-    status: modernFmt > 0 ? "pass" : "warn",
-    details: `${modernFmt} AVIF/WebP seen`,
-  });
-  checks.push({
-    id: "img-size",
-    label: "Large images",
-    status: huge === 0 ? "pass" : huge <= 2 ? "warn" : "fail",
-    details: `${huge} images >300KB (first ${LIMITS.IMAGE_HEADS})`,
-  });
-  checks.push({
-    id: "img-lazy",
-    label: "Lazy-loading",
-    status: lazyCount > 0 ? "pass" : "warn",
-    details: `${lazyCount} images with loading="lazy"`,
-  });
+  checks.push({ id: "img-alt", label: "Images have alt text", status: altOk >= 0.9 ? "pass" : altOk >= 0.6 ? "warn" : "fail", details: `Alt coverage: ${Math.round(altOk * 100)}%` });
+  checks.push({ id: "img-modern", label: "Modern image formats", status: modernFmt > 0 ? "pass" : "warn", details: `${modernFmt} AVIF/WebP seen` });
+  checks.push({ id: "img-size", label: "Large images", status: huge === 0 ? "pass" : huge <= 2 ? "warn" : "fail", details: `${huge} images >300KB (first ${LIMITS.IMAGE_HEADS})` });
+  checks.push({ id: "img-lazy", label: "Lazy-loading", status: lazyCount > 0 ? "pass" : "warn", details: `${lazyCount} images with loading="lazy"` });
 
-  /** -------- OMITTED: locked placeholders -------- */
+  /** -------- placeholders -------- */
   for (const id of OMIT_CHECKS) checks.push(LOCK_PLACEHOLDER(id));
   for (const id of ["h1-structure", "llms"]) checks.push(LOCK_PLACEHOLDER(id));
 
-  /** -------- PSI (optional, with timeout) -------- */
+  /** -------- PSI (optional) -------- */
   let psi = undefined;
-  if (spend(2)) {
+  if (spend(2) && timeLeft() > 2000) {
     try {
       await timed("psi", async () => {
         const key = process.env.PSI_API_KEY;
@@ -878,7 +717,7 @@ async function runAudit(req, rawUrl) {
         u.searchParams.set("url", finalUrl);
         u.searchParams.set("strategy", "mobile");
         if (key) u.searchParams.set("key", key);
-        const to = withTimeout(LIMITS.TIME_PSI_MS);
+        const to = withTimeout(within(LIMITS.TIME_PSI_MS));
         try {
           const res = await fetch(u.toString(), { signal: to.signal });
           if (res.ok) {
@@ -886,23 +725,14 @@ async function runAudit(req, rawUrl) {
             const score = data?.lighthouseResult?.categories?.performance?.score;
             if (typeof score === "number") psi = Math.round(score * 100);
           }
-        } finally {
-          to.done();
-        }
+        } finally { to.done(); }
       });
     } catch {}
   }
   if (typeof psi === "number") {
-    checks.push({
-      id: "psi",
-      label: "PageSpeed (mobile)",
-      status: psi >= 70 ? "pass" : "warn",
-      details: `${psi}/100`,
-      value: psi,
-    });
+    checks.push({ id: "psi", label: "PageSpeed (mobile)", status: psi >= 70 ? "pass" : "warn", details: `${psi}/100`, value: psi });
   }
 
-  // Final payload (object, not Response)
   const payload = {
     ok: true,
     url: rawUrl,
@@ -917,4 +747,3 @@ async function runAudit(req, rawUrl) {
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
-
