@@ -10,13 +10,13 @@ const UA_HEADERS = {
 
 /** ---------- limits / budget ---------- */
 const LIMITS = {
-  SITEMAP_SAMPLES: 2,      // was 5
-  IMAGE_HEADS: 4,          // was 8
+  SITEMAP_SAMPLES: 2,
+  IMAGE_HEADS: 4,
   TIME_PAGE_MS: 12000,
-  TIME_ASSET_MS: 5000,     // favicon, og:image, image HEADs
-  TIME_SMALL_MS: 4000,     // robots, www variant, etc.
+  TIME_ASSET_MS: 5000,
+  TIME_SMALL_MS: 4000,
   TIME_PSI_MS: 10000,
-  MAX_SUBREQUESTS: 12,     // cap "optional" sub-requests
+  MAX_SUBREQUESTS: 12,
 };
 
 /** ---------- omit compute, but return locked placeholders ---------- */
@@ -26,16 +26,6 @@ const OMIT_CHECKS = new Set([
   "https-redirect",
   "compression",
   "structured-data",
-]);
-
-const ALWAYS_LOCK_IDS = new Set([
-  "mixed-content",
-  "security-headers",
-  "https-redirect",
-  "compression",
-  "structured-data",
-  "h1-structure",
-  "llms",
 ]);
 
 const LABELS = {
@@ -77,15 +67,63 @@ export async function OPTIONS(req) {
   return new Response(null, { status: 204, headers: corsHeadersFrom(req) });
 }
 
+/** ---------- simple in-memory cache (per process) ---------- */
+const CACHE_TTL_MS = parseInt(process.env.AUDIT_CACHE_TTL_MS || "90000", 10); // 90s default
+const CACHE = new Map(); // key -> { payload, createdAt, expiresAt }
+
+function normalizeKey(rawUrl) {
+  try {
+    const u = new URL(/^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`);
+    u.hash = "";
+    // Drop query to avoid cache misses due to UTM etc. Keep path & host.
+    u.search = "";
+    // Normalize trailing slash
+    const path = u.pathname.replace(/\/+$/, "/");
+    return `${u.origin}${path}`;
+  } catch {
+    return String(rawUrl || "");
+  }
+}
+function cacheGet(key) {
+  const rec = CACHE.get(key);
+  if (!rec) return null;
+  if (Date.now() > rec.expiresAt) {
+    CACHE.delete(key);
+    return null;
+  }
+  return rec;
+}
+function cacheSet(key, payload) {
+  const now = Date.now();
+  CACHE.set(key, { payload, createdAt: now, expiresAt: now + CACHE_TTL_MS });
+}
+
 /** ---------- GET ---------- */
-// /api/check            -> { ok:true, ping:"pong" }
-// /api/check?url=...    -> run audit (no preflight)
+// /api/check                      -> { ok:true, ping:"pong" }
+// /api/check?url=...              -> run audit (no preflight)
+// /api/check?url=...&nocache=1    -> bypass cache for this call
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
   const rawUrl = searchParams.get("url");
   if (!rawUrl) return json(req, 200, { ok: true, ping: "pong" });
+
+  const noCache = searchParams.get("nocache") === "1";
+  const key = normalizeKey(rawUrl);
+  if (!noCache) {
+    const hit = cacheGet(key);
+    if (hit) {
+      const age = Date.now() - hit.createdAt;
+      // Never include _diag from cache (keeps payload lean)
+      return json(req, 200, { ...hit.payload, cached: true, cacheAgeMs: age });
+    }
+  }
+
   try {
-    return await runAudit(req, rawUrl);
+    const out = await runAudit(req, rawUrl);
+    // Store a copy without _diag
+    const { _diag, ...copy } = out;
+    cacheSet(key, copy);
+    return json(req, 200, { ...copy, _diag: out._diag });
   } catch (e) {
     const msg =
       e?.name === "AbortError"
@@ -99,12 +137,27 @@ export async function GET(req) {
 }
 
 /** ---------- POST ---------- */
+// Body: { url, nocache?: boolean }
 export async function POST(req) {
   try {
     const body = await req.json().catch(() => ({}));
     const rawUrl = body?.url;
+    const noCache = !!body?.nocache;
     if (!rawUrl) return json(req, 400, { ok: false, errors: ["Invalid URL"] });
-    return await runAudit(req, rawUrl);
+
+    const key = normalizeKey(rawUrl);
+    if (!noCache) {
+      const hit = cacheGet(key);
+      if (hit) {
+        const age = Date.now() - hit.createdAt;
+        return json(req, 200, { ...hit.payload, cached: true, cacheAgeMs: age });
+      }
+    }
+
+    const out = await runAudit(req, rawUrl);
+    const { _diag, ...copy } = out;
+    cacheSet(key, copy);
+    return json(req, 200, { ...copy, _diag: out._diag });
   } catch (e) {
     const msg =
       e?.name === "AbortError"
@@ -314,7 +367,7 @@ async function runAudit(req, rawUrl) {
     try {
       await timed("favicon", async () => {
         const r = await tryHeadThenGet(faviconUrl, {
-          timeoutMs: LIMITS.TIME_ASSET_MS,
+          timeoutMs: LIMITS.TiME_ASSET_MS, // fallback to LIMITS.TIME_ASSET_MS via tryHeadThenGet default
         });
         faviconLoads = isOk(r);
       });
@@ -665,7 +718,7 @@ async function runAudit(req, rawUrl) {
     });
   }
 
-  // Final payload
+  // Final payload (object, not Response)
   const payload = {
     ok: true,
     url: rawUrl,
@@ -675,10 +728,8 @@ async function runAudit(req, rawUrl) {
     timingMs,
     title,
     speed: psi,
-    meta: { ogTitle, ogDesc, ogImage },
     checks,
   };
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
-
-  return json(req, 200, payload);
+  return payload;
 }
