@@ -953,17 +953,48 @@ if (sitemapUrl) {
       : "Missing",
   });
 
-  /** -------- Meta robots & X-Robots-Tag -------- */
-  const robotsMetaVal = getMetaName(html, "robots")?.toLowerCase() || "";
-  const robotsHeader = pageRes.headers.get("x-robots-tag")?.toLowerCase() || "";
-  const noindex =
-    /(^|,|\s)noindex(\s|,|$)/.test(robotsMetaVal) || /noindex/.test(robotsHeader);
-  checks.push({
-    id: "meta-robots",
-    label: "Robots directives",
-    status: noindex ? "fail" : "pass",
-    details: robotsHeader ? `Header: ${robotsHeader}` : robotsMetaVal ? `Meta: ${robotsMetaVal}` : "None",
-  });
+  /** -------- Noindex (hard-fail) + Robots directives -------- */
+const robotsMeta = (getMetaName(html, "robots") || "").toLowerCase();
+const googlebotMeta = (getMetaName(html, "googlebot") || "").toLowerCase();
+const bingbotMeta = (getMetaName(html, "bingbot") || "").toLowerCase();
+const xRobotsHeader = (pageRes.headers.get("x-robots-tag") || "").toLowerCase();
+
+// 'none' equals 'noindex,nofollow'
+const hasNoindex = (s) => /\bnoindex\b/.test(s) || /\bnone\b/.test(s);
+
+// where exactly did we see it?
+const noindexSources = [];
+if (hasNoindex(robotsMeta)) noindexSources.push("meta[name=robots]");
+if (hasNoindex(googlebotMeta)) noindexSources.push("meta[name=googlebot]");
+if (hasNoindex(bingbotMeta)) noindexSources.push("meta[name=bingbot]");
+if (hasNoindex(xRobotsHeader)) noindexSources.push("X-Robots-Tag header");
+
+// New: dedicated noindex check (very bad for SEO)
+checks.push({
+  id: "noindex",
+  label: "Noindex directive",
+  status: noindexSources.length ? "fail" : "pass",
+  details: noindexSources.length
+    ? `Found in: ${noindexSources.join(", ")}`
+    : "Not detected",
+});
+
+// Keep a separate, more general “robots directives” card (informational).
+// We avoid double-failing here: if 'noindex' exists, this becomes 'warn'.
+const robotsStrings = [
+  robotsMeta && `meta: ${robotsMeta}`,
+  googlebotMeta && `googlebot: ${googlebotMeta}`,
+  bingbotMeta && `bingbot: ${bingbotMeta}`,
+  xRobotsHeader && `header: ${xRobotsHeader}`,
+].filter(Boolean);
+
+checks.push({
+  id: "meta-robots",
+  label: "Robots directives",
+  status: robotsStrings.length ? (noindexSources.length ? "warn" : "pass") : "pass",
+  details: robotsStrings.length ? robotsStrings.join(" | ") : "None",
+});
+
 
   /** -------- Meta description + title length -------- */
   const metaDesc = getMetaName(html, "description") || "";
@@ -1063,6 +1094,7 @@ if (sitemapUrl) {
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
