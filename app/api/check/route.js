@@ -1,5 +1,6 @@
 // app/api/check/route.js
-export const runtime = "nodejs";
+// export const runtime = "nodejs";
+export const runtime = "edge";
 
 /** ---------- polite request headers ---------- */
 const UA_HEADERS = {
@@ -29,19 +30,18 @@ const BROWSER_HEADERS = {
 
 const BLOCK_CODES = new Set([401, 403, 429]);
 
-/** ---------- limits / budgets ---------- */
-const LIMITS = {
-  SITEMAP_SAMPLES: 2,
-  IMAGE_HEADS: 4,
-  TIME_PAGE_MS: 12000,   // main page fetch
-  TIME_ASSET_MS: 5000,   // small asset probes
-  TIME_SMALL_MS: 4000,   // robots/sitemap HEAD
-  TIME_PSI_MS: 10000,    // PSI call
-  MAX_SUBREQUESTS: 12,
-};
+// Global cap for the whole audit (leave headroom for cold start)
+const OVERALL_BUDGET_MS = parseInt(process.env.AUDIT_BUDGET_MS || "8500", 10);
 
-// NEW: overall wall-clock budget for the whole audit
-const OVERALL_BUDGET_MS = parseInt(process.env.AUDIT_BUDGET_MS || "14000", 10);
+const LIMITS = {
+  SITEMAP_SAMPLES: 1,     // was 2
+  IMAGE_HEADS: 2,         // was 4
+  TIME_PAGE_MS: 6000,     // was 12000
+  TIME_ASSET_MS: 2000,    // was 5000
+  TIME_SMALL_MS: 1500,    // was 4000
+  TIME_PSI_MS: 2500,      // was 10000
+  MAX_SUBREQUESTS: 8,     // was 12
+};
 
 /** ---------- omit compute, but return locked placeholders ---------- */
 const OMIT_CHECKS = new Set([
@@ -747,3 +747,4 @@ async function runAudit(req, rawUrl) {
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
