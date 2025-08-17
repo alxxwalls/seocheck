@@ -1,15 +1,25 @@
 // app/api/check/route.js
 export const runtime = "nodejs";
 
-/** ---------- polite request headers for target sites ---------- */
+/** ---------- polite request headers ---------- */
 const UA_HEADERS = {
   "user-agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
   "accept-language": "en-GB,en;q=0.9",
 };
 
-/** ---------- locking / omission config ---------- */
-// Checks we do NOT compute server-side, but still include as locked placeholders in the JSON
+/** ---------- limits / budget ---------- */
+const LIMITS = {
+  SITEMAP_SAMPLES: 2,      // was 5
+  IMAGE_HEADS: 4,          // was 8
+  TIME_PAGE_MS: 12000,
+  TIME_ASSET_MS: 5000,     // favicon, og:image, image HEADs
+  TIME_SMALL_MS: 4000,     // robots, www variant, etc.
+  TIME_PSI_MS: 10000,
+  MAX_SUBREQUESTS: 12,     // cap "optional" sub-requests
+};
+
+/** ---------- omit compute, but return locked placeholders ---------- */
 const OMIT_CHECKS = new Set([
   "mixed-content",
   "security-headers",
@@ -18,7 +28,6 @@ const OMIT_CHECKS = new Set([
   "structured-data",
 ]);
 
-// Always show these as locked placeholders (teasers)
 const ALWAYS_LOCK_IDS = new Set([
   "mixed-content",
   "security-headers",
@@ -29,7 +38,6 @@ const ALWAYS_LOCK_IDS = new Set([
   "llms",
 ]);
 
-// Nice labels for placeholders
 const LABELS = {
   "mixed-content": "No mixed content",
   "security-headers": "Security headers",
@@ -69,11 +77,9 @@ export async function OPTIONS(req) {
   return new Response(null, { status: 204, headers: corsHeadersFrom(req) });
 }
 
-/**
- * GET
- * - /api/check            -> health ping
- * - /api/check?url=...    -> run audit (no preflight)
- */
+/** ---------- GET ---------- */
+// /api/check            -> { ok:true, ping:"pong" }
+// /api/check?url=...    -> run audit (no preflight)
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
   const rawUrl = searchParams.get("url");
@@ -92,7 +98,7 @@ export async function GET(req) {
   }
 }
 
-/** ---------- POST (JSON body { url }) ---------- */
+/** ---------- POST ---------- */
 export async function POST(req) {
   try {
     const body = await req.json().catch(() => ({}));
@@ -120,7 +126,7 @@ const withTimeout = (ms = 12000) => {
   return { signal: c.signal, done: () => clearTimeout(id) };
 };
 
-// Retry helper: retries fn() on AbortError or network-ish errors with backoff + jitter
+// retries on AbortError / common network errors, with backoff + jitter
 async function retry(fn, { tries = 2, baseDelay = 400 } = {}) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
@@ -146,10 +152,9 @@ async function retry(fn, { tries = 2, baseDelay = 400 } = {}) {
 
 const tryHeadThenGet = async (
   url,
-  { timeoutMs = 12000, redirect = "follow" } = {}
+  { timeoutMs = LIMITS.TIME_ASSET_MS, redirect = "follow" } = {}
 ) => {
   return retry(async () => {
-    // HEAD first
     const t1 = withTimeout(timeoutMs);
     try {
       const r = await fetch(url, {
@@ -162,7 +167,6 @@ const tryHeadThenGet = async (
       if (r.status === 405 || r.status === 501) throw new Error("HEAD not allowed");
       return r;
     } catch {
-      // GET fallback
       const t2 = withTimeout(timeoutMs);
       try {
         return await fetch(url, {
@@ -205,57 +209,46 @@ const getMetaBy = (html, attr, name) => {
 const getMetaName = (html, name) => getMetaBy(html, "name", name);
 const getMetaProp = (html, prop) => getMetaBy(html, "property", prop);
 
-const findIconHref = (html) => {
-  const links = [...html.matchAll(/<link[^>]*>/gi)].map((x) => x[0]);
-  const iconLinks = links.filter((l) =>
-    /rel=["'][^"']*icon[^"']*["']/i.test(l)
-  );
-  for (const tag of iconLinks) {
-    const m = /href=["']([^"']+)["']/i.exec(tag);
-    if (m) return m[1];
-  }
-  return null;
-};
-
-const getHostVariant = (host) =>
-  /^www\./i.test(host) ? host.replace(/^www\./i, "") : "www." + host;
-
-/** Optional PSI performance score */
-async function fetchPsiPerformance(url) {
-  try {
-    const key = process.env.PSI_API_KEY;
-    const u = new URL("https://www.googleapis.com/pagespeedonline/v5/runPagespeed");
-    u.searchParams.set("url", url);
-    u.searchParams.set("strategy", "mobile");
-    if (key) u.searchParams.set("key", key);
-    const res = await fetch(u.toString());
-    if (!res.ok) return undefined;
-    const data = await res.json();
-    const score = data?.lighthouseResult?.categories?.performance?.score;
-    if (typeof score === "number") return Math.round(score * 100);
-  } catch {}
-  return undefined;
-}
-
-/** ---------- shared audit logic (used by GET & POST) ---------- */
+/** ---------- audit core ---------- */
 async function runAudit(req, rawUrl) {
   const normalizedUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
 
-  // MAIN PAGE FETCH with timeout + UA + one retry
-  const t0 = Date.now();
-  const pageRes = await retry(async () => {
-    const to = withTimeout(12000);
+  // diag (only when DEBUG_AUDIT=1)
+  const DIAG = [];
+  const timed = async (label, fn) => {
+    const t = Date.now();
     try {
-      return await fetch(normalizedUrl, {
-        redirect: "follow",
-        signal: to.signal,
-        headers: UA_HEADERS,
-        cache: "no-store",
-      });
+      return await fn();
     } finally {
-      to.done();
+      if (process.env.DEBUG_AUDIT === "1") DIAG.push({ label, ms: Date.now() - t });
     }
-  });
+  };
+
+  // sub-request budget
+  let budget = LIMITS.MAX_SUBREQUESTS;
+  const spend = (n = 1) => {
+    if (budget - n < 0) return false;
+    budget -= n;
+    return true;
+  };
+
+  // MAIN PAGE FETCH
+  const t0 = Date.now();
+  const pageRes = await timed("page", () =>
+    retry(async () => {
+      const to = withTimeout(LIMITS.TIME_PAGE_MS);
+      try {
+        return await fetch(normalizedUrl, {
+          redirect: "follow",
+          signal: to.signal,
+          headers: UA_HEADERS,
+          cache: "no-store",
+        });
+      } finally {
+        to.done();
+      }
+    })
+  );
 
   const html = await pageRes.text();
   const timingMs = Date.now() - t0;
@@ -274,10 +267,23 @@ async function runAudit(req, rawUrl) {
   const ogImageRel = getMetaProp(html, "og:image");
   const ogImage = ogImageRel ? absUrl(finalUrl, ogImageRel) : undefined;
   let ogImageLoads = undefined;
-  if (ogImage) {
+  if (ogImage && spend()) {
     try {
-      const r = await tryHeadThenGet(ogImage, { timeoutMs: 8000 });
-      ogImageLoads = isOk(r);
+      await timed("og:image", async () => {
+        // GET-first (many CDNs 405 on HEAD)
+        const to = withTimeout(LIMITS.TIME_ASSET_MS);
+        try {
+          const r = await fetch(ogImage, {
+            method: "GET",
+            signal: to.signal,
+            headers: UA_HEADERS,
+            cache: "no-store",
+          });
+          ogImageLoads = r.ok;
+        } finally {
+          to.done();
+        }
+      });
     } catch {
       ogImageLoads = false;
     }
@@ -297,13 +303,21 @@ async function runAudit(req, rawUrl) {
   });
 
   /** -------- Favicon -------- */
-  const iconRel = findIconHref(html) || "/favicon.ico";
-  const faviconUrl = absUrl(finalUrl, iconRel);
   let faviconLoads = undefined;
-  if (faviconUrl) {
+  let faviconUrl = undefined;
+  const iconRelMatch = [...html.matchAll(/<link[^>]*rel=["'][^"']*icon[^"']*["'][^>]*>/gi)][0]?.[0];
+  const iconHref = iconRelMatch
+    ? iconRelMatch.match(/href=["']([^"']+)["']/i)?.[1]
+    : null;
+  faviconUrl = absUrl(finalUrl, iconHref || "/favicon.ico");
+  if (faviconUrl && spend()) {
     try {
-      const r = await tryHeadThenGet(faviconUrl, { timeoutMs: 6000 });
-      faviconLoads = isOk(r);
+      await timed("favicon", async () => {
+        const r = await tryHeadThenGet(faviconUrl, {
+          timeoutMs: LIMITS.TIME_ASSET_MS,
+        });
+        faviconLoads = isOk(r);
+      });
     } catch {
       faviconLoads = false;
     }
@@ -322,27 +336,29 @@ async function runAudit(req, rawUrl) {
   let robotsSitemapListed = false;
   try {
     const robotsURL = absUrl(origin + "/", "/robots.txt");
-    const r = await retry(async () => {
-      const tor = withTimeout(8000);
-      try {
-        return await fetch(robotsURL, {
-          redirect: "follow",
-          signal: tor.signal,
-          headers: UA_HEADERS,
-          cache: "no-store",
-        });
-      } finally {
-        tor.done();
+    await timed("robots", async () => {
+      const r = await retry(async () => {
+        const tor = withTimeout(LIMITS.TIME_SMALL_MS);
+        try {
+          return await fetch(robotsURL, {
+            redirect: "follow",
+            signal: tor.signal,
+            headers: UA_HEADERS,
+            cache: "no-store",
+          });
+        } finally {
+          tor.done();
+        }
+      });
+      if (r.ok) {
+        robotsExists = true;
+        const text = await r.text();
+        const blocks = text.split(/(?=^User-agent:\s*)/gim);
+        const star = blocks.find((b) => /^User-agent:\s*\*/im.test(b)) || "";
+        if (/^\s*Disallow:\s*\/\s*$/im.test(star)) robotsAllowsIndex = false;
+        robotsSitemapListed = /(^|\n)\s*Sitemap:\s*https?:\/\//i.test(text);
       }
     });
-    if (r.ok) {
-      robotsExists = true;
-      const text = await r.text();
-      const blocks = text.split(/(?=^User-agent:\s*)/gim);
-      const star = blocks.find((b) => /^User-agent:\s*\*/im.test(b)) || "";
-      if (/^\s*Disallow:\s*\/\s*$/im.test(star)) robotsAllowsIndex = false;
-      robotsSitemapListed = /(^|\n)\s*Sitemap:\s*https?:\/\//i.test(text);
-    }
   } catch {}
   checks.push({
     id: "robots",
@@ -362,46 +378,53 @@ async function runAudit(req, rawUrl) {
   for (const p of ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml"]) {
     const u = absUrl(origin + "/", p);
     try {
-      const h = await tryHeadThenGet(u, { timeoutMs: 7000 });
-      if (isOk(h)) {
-        sitemapUrl = u;
-        break;
-      }
+      await timed(`sitemap-head ${p}`, async () => {
+        const h = await tryHeadThenGet(u, { timeoutMs: LIMITS.TIME_SMALL_MS });
+        if (isOk(h) && !sitemapUrl) sitemapUrl = u;
+      });
+      if (sitemapUrl) break;
     } catch {}
   }
   if (sitemapUrl) {
     try {
-      const r = await retry(async () => {
-        const tos = withTimeout(12000);
-        try {
-          return await fetch(sitemapUrl, {
-            redirect: "follow",
-            signal: tos.signal,
-            headers: UA_HEADERS,
-            cache: "no-store",
-          });
-        } finally {
-          tos.done();
+      await timed("sitemap-get", async () => {
+        const r = await retry(async () => {
+          const tos = withTimeout(LIMITS.TIME_PAGE_MS);
+          try {
+            return await fetch(sitemapUrl, {
+              redirect: "follow",
+              signal: tos.signal,
+              headers: UA_HEADERS,
+              cache: "no-store",
+            });
+          } finally {
+            tos.done();
+          }
+        });
+        if (r.ok) {
+          const xml = await r.text();
+          const locs = [...xml.matchAll(/<loc>([\s\S]*?)<\/loc>/gi)].map((m) => m[1].trim());
+          const absLocs = locs.map((h) => absUrl(sitemapUrl, h)).filter(Boolean);
+          sitemapHasUrls = absLocs.length > 0;
+          const toCheck = absLocs.slice(0, LIMITS.SITEMAP_SAMPLES);
+          const results = await Promise.all(
+            toCheck.map(async (u, i) => {
+              if (!spend()) return false;
+              try {
+                return await timed(`sitemap-sample-${i}`, async () => {
+                  const rr = await tryHeadThenGet(u, {
+                    timeoutMs: LIMITS.TIME_ASSET_MS,
+                  });
+                  return isOk(rr);
+                });
+              } catch {
+                return false;
+              }
+            })
+          );
+          sitemapSampleOk = results.filter(Boolean).length;
         }
       });
-      if (r.ok) {
-        const xml = await r.text();
-        const locs = [...xml.matchAll(/<loc>([\s\S]*?)<\/loc>/gi)].map((m) => m[1].trim());
-        const absLocs = locs.map((h) => absUrl(sitemapUrl, h)).filter(Boolean);
-        sitemapHasUrls = absLocs.length > 0;
-        const toCheck = absLocs.slice(0, 5);
-        const results = await Promise.all(
-          toCheck.map(async (u) => {
-            try {
-              const rr = await tryHeadThenGet(u, { timeoutMs: 6000 });
-              return isOk(rr);
-            } catch {
-              return false;
-            }
-          })
-        );
-        sitemapSampleOk = results.filter(Boolean).length;
-      }
     } catch {}
   }
   checks.push({
@@ -413,39 +436,42 @@ async function runAudit(req, rawUrl) {
       : "No sitemap found",
   });
 
-  /** -------- www ↔ non-www redirect -------- */
+  /** -------- www ↔ non-www redirect (canonical host) -------- */
   let canonicalization = { tested: false, from: "", to: "", code: 0, good: false };
   try {
-    const variantHost = getHostVariant(host);
-    if (variantHost !== host) {
+    const variantHost =
+      /^www\./i.test(host) ? host.replace(/^www\./i, "") : "www." + host;
+    if (variantHost !== host && spend()) {
       const variantOrigin = `${urlObj.protocol}//${variantHost}`;
       const variantUrl = variantOrigin + "/";
-      const r = await retry(async () => {
-        const tv = withTimeout(7000);
-        try {
-          return await fetch(variantUrl, {
-            method: "GET",
-            redirect: "manual",
-            signal: tv.signal,
-            headers: UA_HEADERS,
-            cache: "no-store",
-          });
-        } finally {
-          tv.done();
+      await timed("www-variant", async () => {
+        const r = await retry(async () => {
+          const tv = withTimeout(LIMITS.TIME_SMALL_MS);
+          try {
+            return await fetch(variantUrl, {
+              method: "GET",
+              redirect: "manual",
+              signal: tv.signal,
+              headers: UA_HEADERS,
+              cache: "no-store",
+            });
+          } finally {
+            tv.done();
+          }
+        });
+        const code = r.status;
+        const loc = r.headers.get("location");
+        let good = false;
+        let to2 = "";
+        if (loc) {
+          const resolved = absUrl(variantUrl, loc);
+          to2 = resolved || loc;
+          try {
+            good = new URL(to2).host === host && [301, 308, 302, 307].includes(code);
+          } catch {}
         }
+        canonicalization = { tested: true, from: variantUrl, to: to2, code, good };
       });
-      const code = r.status;
-      const loc = r.headers.get("location");
-      let good = false;
-      let to2 = "";
-      if (loc) {
-        const resolved = absUrl(variantUrl, loc);
-        to2 = resolved || loc;
-        try {
-          good = new URL(to2).host === host && [301, 308, 302, 307].includes(code);
-        } catch {}
-      }
-      canonicalization = { tested: true, from: variantUrl, to: to2, code, good };
     }
   } catch {
     canonicalization = { tested: true, from: "", to: "", code: 0, good: false };
@@ -553,23 +579,26 @@ async function runAudit(req, rawUrl) {
   const lazyCount = imgTags.filter((t) => /loading=["']lazy["']/i.test(t)).length;
 
   let huge = 0;
-  for (const u of imgSrcs.slice(0, 8)) {
+  for (const [i, u] of imgSrcs.slice(0, LIMITS.IMAGE_HEADS).entries()) {
+    if (!spend()) break;
     try {
-      const r = await retry(async () => {
-        const th = withTimeout(6000);
-        try {
-          return await fetch(u, {
-            method: "HEAD",
-            signal: th.signal,
-            headers: UA_HEADERS,
-            cache: "no-store",
-          });
-        } finally {
-          th.done();
-        }
+      await timed(`img-head-${i}`, async () => {
+        const r = await retry(async () => {
+          const th = withTimeout(LIMITS.TIME_ASSET_MS);
+          try {
+            return await fetch(u, {
+              method: "HEAD",
+              signal: th.signal,
+              headers: UA_HEADERS,
+              cache: "no-store",
+            });
+          } finally {
+            th.done();
+          }
+        });
+        const len = parseInt(r.headers.get("content-length") || "0", 10);
+        if (len > 300_000) huge++;
       });
-      const len = parseInt(r.headers.get("content-length") || "0", 10);
-      if (len > 300_000) huge++;
     } catch {}
   }
 
@@ -589,7 +618,7 @@ async function runAudit(req, rawUrl) {
     id: "img-size",
     label: "Large images",
     status: huge === 0 ? "pass" : huge <= 2 ? "warn" : "fail",
-    details: `${huge} images >300KB (first 8)`,
+    details: `${huge} images >300KB (first ${LIMITS.IMAGE_HEADS})`,
   });
   checks.push({
     id: "img-lazy",
@@ -598,17 +627,34 @@ async function runAudit(req, rawUrl) {
     details: `${lazyCount} images with loading="lazy"`,
   });
 
-  /** -------- OMITTED CHECKS: add locked placeholders instead -------- */
-  for (const id of OMIT_CHECKS) {
-    checks.push(LOCK_PLACEHOLDER(id));
-  }
-  // Teasers that are always locked
-  for (const id of ["h1-structure", "llms"]) {
-    checks.push(LOCK_PLACEHOLDER(id));
-  }
+  /** -------- OMITTED: locked placeholders -------- */
+  for (const id of OMIT_CHECKS) checks.push(LOCK_PLACEHOLDER(id));
+  for (const id of ["h1-structure", "llms"]) checks.push(LOCK_PLACEHOLDER(id));
 
-  /** -------- PSI (optional) -------- */
-  const psi = await fetchPsiPerformance(finalUrl);
+  /** -------- PSI (optional, with timeout) -------- */
+  let psi = undefined;
+  if (spend(2)) {
+    try {
+      await timed("psi", async () => {
+        const key = process.env.PSI_API_KEY;
+        const u = new URL("https://www.googleapis.com/pagespeedonline/v5/runPagespeed");
+        u.searchParams.set("url", finalUrl);
+        u.searchParams.set("strategy", "mobile");
+        if (key) u.searchParams.set("key", key);
+        const to = withTimeout(LIMITS.TIME_PSI_MS);
+        try {
+          const res = await fetch(u.toString(), { signal: to.signal });
+          if (res.ok) {
+            const data = await res.json();
+            const score = data?.lighthouseResult?.categories?.performance?.score;
+            if (typeof score === "number") psi = Math.round(score * 100);
+          }
+        } finally {
+          to.done();
+        }
+      });
+    } catch {}
+  }
   if (typeof psi === "number") {
     checks.push({
       id: "psi",
@@ -620,7 +666,7 @@ async function runAudit(req, rawUrl) {
   }
 
   // Final payload
-  return json(req, 200, {
+  const payload = {
     ok: true,
     url: rawUrl,
     normalizedUrl,
@@ -631,5 +677,8 @@ async function runAudit(req, rawUrl) {
     speed: psi,
     meta: { ogTitle, ogDesc, ogImage },
     checks,
-  });
+  };
+  if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
+
+  return json(req, 200, payload);
 }
