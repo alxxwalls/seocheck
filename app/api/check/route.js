@@ -391,7 +391,7 @@ for (const u of candidates) {
       timeoutMs: within ? within(LIMITS.TIME_SMALL_MS) : LIMITS.TIME_SMALL_MS,
       headers: BROWSER_HEADERS,
     });
-    if (isOk(h)) { sitemapFound = u; break; }
+    if (isOk(h)) { sitemapFound = h.url || u; break; }
   } catch {}
 }
 
@@ -766,15 +766,18 @@ const candidates = [...candidateSet].filter(Boolean);
 for (const u of candidates) {
   if (timeLeft() < 250) break;
   try {
-    await timed(`sitemap-head ${new URL(u).pathname}`, async () => {
-      const h = await tryHeadThenGet(u, { timeoutMs: within(LIMITS.TIME_SMALL_MS), headers: BROWSER_HEADERS, });
-      if (isOk(h) && !sitemapUrl) {
-        sitemapUrl = u;
-        const ct = (h.headers.get("content-type") || "").toLowerCase();
-        sitemapGzipped =
-          /\.gz(\?|#|$)/i.test(u) ||
-          /application\/gzip|application\/x-gzip/i.test(ct);
-      }
+    const h = await tryHeadThenGet(u, {
+    timeoutMs: within(LIMITS.TIME_SMALL_MS),
+    headers: BROWSER_HEADERS,
+  });
+  if (isOk(h) && !sitemapUrl) {
+    const final = h.url || u;        // <- use the final URL after redirects
+    sitemapUrl = final;
+    const ct = (h.headers.get("content-type") || "").toLowerCase();
+    sitemapGzipped =
+      /\.gz(\?|#|$)/i.test(final) ||
+      /application\/gzip|application\/x-gzip/i.test(ct);
+  }
     });
     if (sitemapUrl) break;
   } catch {}
@@ -806,14 +809,16 @@ if (sitemapUrl) {
           }
         });
         if (r.ok) {
+          const sitemapFinal = r.url || sitemapUrl; // <- final after redirects
           const xml = await r.text();
 
           // Works for both urlset and sitemapindex because we just gather all <loc> values
           const locs = [...xml.matchAll(/<loc>([\s\S]*?)<\/loc>/gi)].map((m) =>
             m[1].trim()
           );
-          const absLocs = locs.map((h) => absUrl(sitemapUrl, h)).filter(Boolean);
+          const absLocs = locs.map((h) => absUrl(sitemapFinal, h)).filter(Boolean);;
           sitemapHasUrls = absLocs.length > 0;
+          sitemapUrl = sitemapFinal; // keep the final for your details
 
           const toCheck = absLocs.slice(0, LIMITS.SITEMAP_SAMPLES);
           const results = await Promise.all(
@@ -1043,6 +1048,7 @@ if (sitemapUrl) {
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
