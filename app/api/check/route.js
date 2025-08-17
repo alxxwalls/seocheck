@@ -314,6 +314,45 @@ async function runAudit(req, rawUrl) {
 
   const checks = [];
 
+  // Find <link rel="canonical" ...> allowing spaces and optional quotes
+function findCanonicalHrefInHtml(html) {
+  const linkTags = [...html.matchAll(/<link\b[^>]*>/gi)].map(m => m[0]);
+  // collect all tags whose rel contains canonical
+  const canonicalTags = linkTags.filter(tag =>
+    /\brel\s*=\s*["']?\s*canonical\s*["']?/i.test(tag)
+  );
+  for (const tag of canonicalTags) {
+    const m = tag.match(/\bhref\s*=\s*["']?([^"'\s>]+)["']?/i);
+    if (m) return { href: m[1], count: canonicalTags.length };
+  }
+  return { href: null, count: canonicalTags.length };
+}
+
+// Some sites set canonical via HTTP Link header
+function findCanonicalHrefInHeader(headers) {
+  const link = headers.get("link");
+  if (!link) return null;
+  // split by comma only when followed by a new angled bracket
+  const parts = link.split(/,(?=\s*<)/);
+  for (const part of parts) {
+    if (!/;\s*rel\s*=\s*"?canonical"?/i.test(part)) continue;
+    const m = part.match(/<([^>]+)>/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+// Normalize two URLs for comparison (strip search/hash, normalize host case and trailing slash)
+function normalizeForCompare(u) {
+  const x = new URL(u);
+  x.hash = "";
+  x.search = "";
+  x.hostname = x.hostname.toLowerCase();
+  // remove trailing slash except for the root
+  if (x.pathname !== "/") x.pathname = x.pathname.replace(/\/+$/, "");
+  return x.toString();
+}
+
   /** -------- Open Graph -------- */
   const ogTitle = getMetaProp(html, "og:title");
   const ogDesc = getMetaProp(html, "og:description");
@@ -552,35 +591,40 @@ async function runAudit(req, rawUrl) {
     details: `${timingMs} ms`,
   });
 
-  /** -------- Canonical tag -------- */
-  const canonTags = [...html.matchAll(/<link[^>]+rel=["']canonical["'][^>]*>/gi)];
-  let canonicalHref,
-    canonicalOk,
-    multipleCanon = false;
-  if (canonTags.length) {
-    multipleCanon = canonTags.length > 1;
-    const hrefm = canonTags[0][0].match(/href=["']([^"']+)["']/i);
-    canonicalHref = hrefm ? absUrl(finalUrl, hrefm[1]) : undefined;
-    try {
-      const a = new URL(canonicalHref);
-      const b = new URL(finalUrl);
-      a.search = "";
-      a.hash = "";
-      b.search = "";
-      b.hash = "";
-      canonicalOk = a.toString() === b.toString();
-    } catch {
-      canonicalOk = undefined;
-    }
+ /** -------- Canonical tag (robust) -------- */
+let canonicalHref;      // absolute URL (if found)
+let canonicalOk;        // boolean | undefined
+let multipleCanon = false;
+
+// 1) Try HTML
+const { href: canonRaw, count: canonCount } = findCanonicalHrefInHtml(html);
+multipleCanon = (canonCount || 0) > 1;
+
+// 2) Fallback: HTTP Link header
+const headerCanon = findCanonicalHrefInHeader(pageRes.headers);
+
+// Pick first available
+const picked = canonRaw || headerCanon;
+if (picked) {
+  canonicalHref = absUrl(finalUrl, picked); // resolve relative to page
+  try {
+    const a = normalizeForCompare(canonicalHref);
+    const b = normalizeForCompare(finalUrl);
+    canonicalOk = a === b;
+  } catch {
+    canonicalOk = undefined;
   }
-  checks.push({
-    id: "canonical",
-    label: "Canonical tag",
-    status: canonicalHref ? (canonicalOk && !multipleCanon ? "pass" : "warn") : "fail",
-    details: canonicalHref
-      ? `${canonicalOk ? "Matches URL" : "Points elsewhere"}${multipleCanon ? " • multiple canonicals" : ""}`
-      : "Missing",
-  });
+}
+
+checks.push({
+  id: "canonical",
+  label: "Canonical tag",
+  status: canonicalHref ? (canonicalOk && !multipleCanon ? "pass" : "warn") : "fail",
+  details: canonicalHref
+    ? `${canonicalOk ? "Matches URL" : `Points to ${canonicalHref}`}${multipleCanon ? " • multiple canonicals" : ""}`
+    : "Missing",
+});
+
 
   /** -------- Meta robots & X-Robots-Tag -------- */
   const robotsMetaVal = getMetaName(html, "robots")?.toLowerCase() || "";
@@ -733,4 +777,5 @@ async function runAudit(req, rawUrl) {
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
