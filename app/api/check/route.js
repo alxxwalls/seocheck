@@ -1,5 +1,4 @@
 // app/api/check/route.js
-// Prefer Node for longer time limits + fewer host blocks
 export const runtime = "nodejs";
 
 /** ---------- polite request headers for target sites ---------- */
@@ -9,10 +8,49 @@ const UA_HEADERS = {
   "accept-language": "en-GB,en;q=0.9",
 };
 
+/** ---------- locking / omission config ---------- */
+// Checks we do NOT compute server-side, but still include as locked placeholders in the JSON
+const OMIT_CHECKS = new Set([
+  "mixed-content",
+  "security-headers",
+  "https-redirect",
+  "compression",
+  "structured-data",
+]);
+
+// Always show these as locked placeholders (teasers)
+const ALWAYS_LOCK_IDS = new Set([
+  "mixed-content",
+  "security-headers",
+  "https-redirect",
+  "compression",
+  "structured-data",
+  "h1-structure",
+  "llms",
+]);
+
+// Nice labels for placeholders
+const LABELS = {
+  "mixed-content": "No mixed content",
+  "security-headers": "Security headers",
+  "https-redirect": "HTTP → HTTPS redirect",
+  "compression": "HTML compression",
+  "structured-data": "Structured data (JSON-LD)",
+  "h1-structure": "Headings (H1/H2) Structure",
+  llms: "LLMs.txt",
+};
+const LOCK_PLACEHOLDER = (id) => ({
+  id,
+  label: LABELS[id] || id,
+  status: "locked",
+  locked: true,
+});
+
 /** ---------- CORS (dynamic echo) ---------- */
 function corsHeadersFrom(req) {
   const origin = req?.headers?.get("origin") || "*";
-  const reqHdrs = req?.headers?.get("access-control-request-headers") || "Content-Type";
+  const reqHdrs =
+    req?.headers?.get("access-control-request-headers") || "Content-Type";
   return {
     "Access-Control-Allow-Origin": origin,
     Vary: "Origin",
@@ -43,8 +81,33 @@ export async function GET(req) {
   try {
     return await runAudit(req, rawUrl);
   } catch (e) {
-    const msg = e?.name === "AbortError" ? "Upstream fetch timed out" : e?.message || "Unknown error";
-    return json(req, e?.name === "AbortError" ? 504 : 500, { ok: false, errors: [msg] });
+    const msg =
+      e?.name === "AbortError"
+        ? "Upstream fetch timed out"
+        : e?.message || "Unknown error";
+    return json(req, e?.name === "AbortError" ? 504 : 500, {
+      ok: false,
+      errors: [msg],
+    });
+  }
+}
+
+/** ---------- POST (JSON body { url }) ---------- */
+export async function POST(req) {
+  try {
+    const body = await req.json().catch(() => ({}));
+    const rawUrl = body?.url;
+    if (!rawUrl) return json(req, 400, { ok: false, errors: ["Invalid URL"] });
+    return await runAudit(req, rawUrl);
+  } catch (e) {
+    const msg =
+      e?.name === "AbortError"
+        ? "Upstream fetch timed out"
+        : e?.message || "Unknown error";
+    return json(req, e?.name === "AbortError" ? 504 : 500, {
+      ok: false,
+      errors: [msg],
+    });
   }
 }
 
@@ -67,7 +130,9 @@ async function retry(fn, { tries = 2, baseDelay = 400 } = {}) {
       lastErr = e;
       const msg = String(e?.message || "");
       const isAbort = e?.name === "AbortError";
-      const isNetty = /fetch failed|network|ECONNRESET|EAI_AGAIN|ENOTFOUND|ETIMEDOUT/i.test(msg);
+      const isNetty = /fetch failed|network|ECONNRESET|EAI_AGAIN|ENOTFOUND|ETIMEDOUT/i.test(
+        msg
+      );
       if (i < tries - 1 && (isAbort || isNetty)) {
         const jitter = Math.floor(Math.random() * 250);
         await new Promise((r) => setTimeout(r, baseDelay * (i + 1) + jitter));
@@ -79,7 +144,10 @@ async function retry(fn, { tries = 2, baseDelay = 400 } = {}) {
   throw lastErr;
 }
 
-const tryHeadThenGet = async (url, { timeoutMs = 12000, redirect = "follow" } = {}) => {
+const tryHeadThenGet = async (
+  url,
+  { timeoutMs = 12000, redirect = "follow" } = {}
+) => {
   return retry(async () => {
     // HEAD first
     const t1 = withTimeout(timeoutMs);
@@ -94,7 +162,7 @@ const tryHeadThenGet = async (url, { timeoutMs = 12000, redirect = "follow" } = 
       if (r.status === 405 || r.status === 501) throw new Error("HEAD not allowed");
       return r;
     } catch {
-      // Fallback to GET
+      // GET fallback
       const t2 = withTimeout(timeoutMs);
       try {
         return await fetch(url, {
@@ -139,7 +207,9 @@ const getMetaProp = (html, prop) => getMetaBy(html, "property", prop);
 
 const findIconHref = (html) => {
   const links = [...html.matchAll(/<link[^>]*>/gi)].map((x) => x[0]);
-  const iconLinks = links.filter((l) => /rel=["'][^"']*icon[^"']*["']/i.test(l));
+  const iconLinks = links.filter((l) =>
+    /rel=["'][^"']*icon[^"']*["']/i.test(l)
+  );
   for (const tag of iconLinks) {
     const m = /href=["']([^"']+)["']/i.exec(tag);
     if (m) return m[1];
@@ -147,7 +217,8 @@ const findIconHref = (html) => {
   return null;
 };
 
-const getHostVariant = (host) => (/^www\./i.test(host) ? host.replace(/^www\./i, "") : "www." + host);
+const getHostVariant = (host) =>
+  /^www\./i.test(host) ? host.replace(/^www\./i, "") : "www." + host;
 
 /** Optional PSI performance score */
 async function fetchPsiPerformance(url) {
@@ -164,19 +235,6 @@ async function fetchPsiPerformance(url) {
     if (typeof score === "number") return Math.round(score * 100);
   } catch {}
   return undefined;
-}
-
-/** ---------- POST (JSON body { url }) ---------- */
-export async function POST(req) {
-  try {
-    const body = await req.json().catch(() => ({}));
-    const rawUrl = body?.url;
-    if (!rawUrl) return json(req, 400, { ok: false, errors: ["Invalid URL"] });
-    return await runAudit(req, rawUrl);
-  } catch (e) {
-    const msg = e?.name === "AbortError" ? "Upstream fetch timed out" : e?.message || "Unknown error";
-    return json(req, e?.name === "AbortError" ? 504 : 500, { ok: false, errors: [msg] });
-  }
 }
 
 /** ---------- shared audit logic (used by GET & POST) ---------- */
@@ -448,7 +506,8 @@ async function runAudit(req, rawUrl) {
   /** -------- Meta robots & X-Robots-Tag -------- */
   const robotsMetaVal = getMetaName(html, "robots")?.toLowerCase() || "";
   const robotsHeader = pageRes.headers.get("x-robots-tag")?.toLowerCase() || "";
-  const noindex = /(^|,|\s)noindex(\s|,|$)/.test(robotsMetaVal) || /noindex/.test(robotsHeader);
+  const noindex =
+    /(^|,|\s)noindex(\s|,|$)/.test(robotsMetaVal) || /noindex/.test(robotsHeader);
   checks.push({
     id: "meta-robots",
     label: "Robots directives",
@@ -479,56 +538,6 @@ async function runAudit(req, rawUrl) {
     label: "Mobile viewport tag",
     status: hasViewport ? "pass" : "fail",
     details: hasViewport ? "Present" : "Missing",
-  });
-
-  /** -------- HTTP → HTTPS redirect -------- */
-  let httpToHttps = undefined,
-    httpCode = 0,
-    httpLoc = "";
-  try {
-    const httpUrl = finalUrl.replace(/^https:/i, "http:");
-    if (httpUrl !== finalUrl) {
-      const r = await retry(async () => {
-        const th = withTimeout(7000);
-        try {
-          return await fetch(httpUrl, {
-            method: "GET",
-            redirect: "manual",
-            signal: th.signal,
-            headers: UA_HEADERS,
-            cache: "no-store",
-          });
-        } finally {
-          th.done();
-        }
-      });
-      httpCode = r.status;
-      httpLoc = r.headers.get("location") || "";
-      httpToHttps = httpLoc.startsWith("https://");
-    }
-  } catch {}
-  checks.push({
-    id: "https-redirect",
-    label: "HTTP → HTTPS redirect",
-    status: httpToHttps === true ? "pass" : httpToHttps === false ? "fail" : "warn",
-    details: httpCode ? `${httpCode} → ${httpLoc || "(no location)"}` : "Not applicable",
-  });
-
-  /** -------- Security headers -------- */
-  const h = pageRes.headers;
-  const sec = {
-    csp: !!h.get("content-security-policy"),
-    xfo: !!h.get("x-frame-options"),
-    xcto: !!h.get("x-content-type-options"),
-    ref: !!h.get("referrer-policy"),
-    hsts: !!h.get("strict-transport-security"),
-  };
-  const have = Object.values(sec).filter(Boolean).length;
-  checks.push({
-    id: "security-headers",
-    label: "Security headers",
-    status: have >= 4 ? "pass" : have >= 2 ? "warn" : "fail",
-    details: `CSP=${sec.csp} XFO=${sec.xfo} XCTO=${sec.xcto} Referrer-Policy=${sec.ref} HSTS=${sec.hsts}`,
   });
 
   /** -------- Images: alt, format, size, lazy -------- */
@@ -589,48 +598,14 @@ async function runAudit(req, rawUrl) {
     details: `${lazyCount} images with loading="lazy"`,
   });
 
-  /** -------- Mixed content (on HTTPS) -------- */
-  let mixed = 0;
-  if (finalUrl.startsWith("https://")) {
-    const httpRefs = [...html.matchAll(/\s(?:src|href)=["']http:\/\/[^"']+["']/gi)];
-    mixed = httpRefs.length;
+  /** -------- OMITTED CHECKS: add locked placeholders instead -------- */
+  for (const id of OMIT_CHECKS) {
+    checks.push(LOCK_PLACEHOLDER(id));
   }
-  checks.push({
-    id: "mixed-content",
-    label: "No mixed content",
-    status: mixed === 0 ? "pass" : mixed <= 3 ? "warn" : "fail",
-    details: mixed ? `${mixed} http:// references` : "None detected",
-  });
-
-  /** -------- Structured data presence -------- */
-  const jsonLdBlocks = [
-    ...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi),
-  ]
-    .map((m) => m[1].trim())
-    .slice(0, 5);
-  let ldTypes = [];
-  for (const block of jsonLdBlocks) {
-    try {
-      const data = JSON.parse(block);
-      const arr = Array.isArray(data) ? data : [data];
-      for (const item of arr) if (item && typeof item === "object" && item["@type"]) ldTypes.push(String(item["@type"]));
-    } catch {}
+  // Teasers that are always locked
+  for (const id of ["h1-structure", "llms"]) {
+    checks.push(LOCK_PLACEHOLDER(id));
   }
-  checks.push({
-    id: "structured-data",
-    label: "Structured data (JSON-LD)",
-    status: ldTypes.length ? "pass" : "warn",
-    details: ldTypes.length ? `Types: ${Array.from(new Set(ldTypes)).join(", ").slice(0, 120)}` : "No JSON-LD found",
-  });
-
-  /** -------- Compression -------- */
-  const enc = pageRes.headers.get("content-encoding") || "";
-  checks.push({
-    id: "compression",
-    label: "HTML compression",
-    status: /br|gzip/i.test(enc) ? "pass" : "warn",
-    details: enc ? `content-encoding: ${enc}` : "No content-encoding header",
-  });
 
   /** -------- PSI (optional) -------- */
   const psi = await fetchPsiPerformance(finalUrl);
@@ -644,7 +619,7 @@ async function runAudit(req, rawUrl) {
     });
   }
 
-  // Success
+  // Final payload
   return json(req, 200, {
     ok: true,
     url: rawUrl,
