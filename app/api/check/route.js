@@ -203,22 +203,61 @@ async function retry(fn, { tries = 2, baseDelay = 400 } = {}) {
 
 const tryHeadThenGet = async (
   url,
-  { timeoutMs = LIMITS.TIME_ASSET_MS, redirect = "follow", headers = UA_HEADERS } = {}
+  {
+    timeoutMs = LIMITS.TIME_ASSET_MS,
+    redirect = "follow",
+    headers = UA_HEADERS,
+    fallbackOnNonOk = true,  // <-- try GET if HEAD isn’t OK
+  } = {}
 ) => {
   return retry(async () => {
+    // Try HEAD
     const t1 = withTimeout(timeoutMs);
+    let headRes;
     try {
-      const r = await fetch(url, { method: "HEAD", redirect, signal: t1.signal, headers, cache: "no-store" });
-      if (r.status === 405 || r.status === 501) throw new Error("HEAD not allowed");
-      return r;
-    } catch {
+      headRes = await fetch(url, {
+        method: "HEAD",
+        redirect,
+        signal: t1.signal,
+        headers,             // <-- now honored
+        cache: "no-store",
+      });
+    } catch (e) {
+      // network error: we’ll fall back below
+    } finally {
+      t1.done();
+    }
+
+    // If HEAD OK, use it
+    if (headRes && headRes.ok) return headRes;
+
+    // Fall back to GET on: HEAD missing/failed, 405/501, or any non-OK if allowed
+    const shouldFallback =
+      !headRes ||
+      headRes.status === 405 ||
+      headRes.status === 501 ||
+      (fallbackOnNonOk && headRes && !headRes.ok);
+
+    if (shouldFallback) {
       const t2 = withTimeout(timeoutMs);
       try {
-        return await fetch(url, { method: "GET", redirect, signal: t2.signal, headers, cache: "no-store" });
-      } finally { t2.done(); }
-    } finally { t1.done(); }
+        return await fetch(url, {
+          method: "GET",
+          redirect,
+          signal: t2.signal,
+          headers,
+          cache: "no-store",
+        });
+      } finally {
+        t2.done();
+      }
+    }
+
+    // Return the HEAD response even if not OK (caller can inspect)
+    return headRes;
   });
 };
+
 
 const absUrl = (base, href) => { try { return new URL(href, base).toString(); } catch { return undefined; } };
 const parseTitle = (html) => { const m = /<title>([\s\S]*?)<\/title>/i.exec(html); return m ? m[1].trim() : ""; };
@@ -728,7 +767,7 @@ for (const u of candidates) {
   if (timeLeft() < 250) break;
   try {
     await timed(`sitemap-head ${new URL(u).pathname}`, async () => {
-      const h = await tryHeadThenGet(u, { timeoutMs: within(LIMITS.TIME_SMALL_MS) });
+      const h = await tryHeadThenGet(u, { timeoutMs: within(LIMITS.TIME_SMALL_MS), headers: BROWSER_HEADERS, });
       if (isOk(h) && !sitemapUrl) {
         sitemapUrl = u;
         const ct = (h.headers.get("content-type") || "").toLowerCase();
@@ -783,7 +822,7 @@ if (sitemapUrl) {
               try {
                 return await timed(`sitemap-sample-${i}`, async () => {
                   const rr = await tryHeadThenGet(u, {
-                    timeoutMs: within(LIMITS.TIME_ASSET_MS),
+                    timeoutMs: within(LIMITS.TIME_ASSET_MS), headers: BROWSER_HEADERS,
                   });
                   return isOk(rr);
                 });
@@ -1004,6 +1043,7 @@ if (sitemapUrl) {
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
