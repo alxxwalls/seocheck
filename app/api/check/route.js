@@ -437,30 +437,151 @@ checks.push({
     throw e; // non-timeout errors behave as before
   }
 
-  // ---- Blocked handling (401/403/429) ----
-  if (BLOCK_CODES.has(pageRes.status)) {
-    await timed("blocked-retry", async () => {
+ // ---- Blocked handling (401/403/429) ----
+if (BLOCK_CODES.has(pageRes.status)) {
+  await timed("blocked-retry", async () => {
+    try {
+      const to2 = withTimeout(within(6000));
       try {
-        const to2 = withTimeout(within(6000));
-        try {
-          const r = await fetch(normalizedUrl, {
-            redirect: "follow",
-            signal: to2.signal,
-            headers: BROWSER_HEADERS,
-            cache: "no-store",
-          });
-          pageRes = r;
-        } finally { to2.done(); }
-      } catch {}
-    });
+        const r = await fetch(normalizedUrl, {
+          redirect: "follow",
+          signal: to2.signal,
+          headers: BROWSER_HEADERS,
+          cache: "no-store",
+        });
+        pageRes = r;
+      } finally { to2.done(); }
+    } catch {}
+  });
 
-    if (BLOCK_CODES.has(pageRes.status)) {
-      // (unchanged) — your enriched blocked fallback
-      // ... [SNIP: keep your existing blocked fallback from previous version] ...
-      // For brevity here, keep the same "blocked" branch we added earlier, it already returns ok:true.
-      return await timeoutPartial(`Blocked by WAF (HTTP ${pageRes.status})`); // <- OPTIONAL: or keep your detailed blocked branch
-    }
+  if (BLOCK_CODES.has(pageRes.status)) {
+    // --- Build a dedicated "blocked" payload so the UI can show the red banner ---
+const status = pageRes.status;
+const finalUrlBlocked = pageRes.url || normalizedUrl;
+
+// derive origin from the blocked URL
+let originBlocked;
+try { originBlocked = new URL(finalUrlBlocked).origin; } catch { originBlocked = normalizedUrl; }
+
+const checks = [];
+
+// 1) The prominent blocked card
+checks.push({
+  id: "blocked",
+  label: "Blocked by bot protection",
+  status: "fail",
+  details: `Received ${status} from ${finalUrlBlocked}`,
+});
+
+// 2) Best-effort robots.txt (to show it’s not *our* error)
+let robotsSitemaps = [];
+try {
+  const robotsURL = new URL("/robots.txt", originBlocked).toString();
+  await timed("robots-blocked", async () => {
+    const tor = withTimeout(within(LIMITS.TIME_SMALL_MS));
+    try {
+      const r = await fetch(robotsURL, {
+        redirect: "follow",
+        signal: tor.signal,
+        headers: BROWSER_HEADERS,
+        cache: "no-store",
+      });
+      if (r.ok) {
+        const txt = await r.text();
+        const matches = [...txt.matchAll(/^\s*Sitemap:\s*(\S+)\s*$/gim)];
+        robotsSitemaps = matches.map((m) => absUrl(robotsURL, m[1])).filter(Boolean);
+
+        const blocks = txt.split(/(?=^User-agent:\s*)/gim);
+        const star = blocks.find((b) => /^User-agent:\s*\*/im.test(b)) || "";
+        const disallowAll = /^\s*Disallow:\s*\/\s*$/im.test(star);
+
+        checks.push({
+          id: "robots",
+          label: "robots.txt allows indexing",
+          status: disallowAll ? "fail" : "warn",
+          details:
+            (disallowAll ? "User-agent: * disallows /" : "Accessible") +
+            (robotsSitemaps.length ? ` • ${robotsSitemaps.length} sitemap URL(s) listed` : ""),
+        });
+      } else {
+        checks.push({
+          id: "robots",
+          label: "robots.txt allows indexing",
+          status: "warn",
+          details: `Unavailable (HTTP ${r.status})`,
+        });
+      }
+    } finally { tor.done(); }
+  });
+} catch {
+  checks.push({ id: "robots", label: "robots.txt allows indexing", status: "warn", details: "Unavailable" });
+}
+
+// 3) Quick sitemap HEAD probe (common + robots + wp-sitemap)
+let sitemapFound = null;
+const candidates = new Set([
+  new URL("/sitemap.xml", originBlocked).toString(),
+  new URL("/sitemap_index.xml", originBlocked).toString(),
+  new URL("/sitemap-index.xml", originBlocked).toString(),
+  new URL("/wp-sitemap.xml", originBlocked).toString(),
+  ...robotsSitemaps,
+]);
+
+for (const u of candidates) {
+  if (timeLeft() < 300) break;
+  try {
+    const h = await tryHeadThenGet(u, {
+      timeoutMs: within(LIMITS.TIME_SMALL_MS),
+      headers: BROWSER_HEADERS,
+    });
+    if (isOk(h)) { sitemapFound = u; break; }
+  } catch {}
+}
+checks.push({
+  id: "sitemap",
+  label: "Sitemap exists & URLs valid",
+  status: sitemapFound ? "warn" : "fail",
+  details: sitemapFound
+    ? `Found: ${sitemapFound} (content not parsed in blocked path)`
+    : "No sitemap found at common paths or in robots.txt",
+});
+
+// 4) Favicon quick probe (nice to have)
+try {
+  const fav = new URL("/favicon.ico", originBlocked).toString();
+  const h = await tryHeadThenGet(fav, { timeoutMs: within(LIMITS.TIME_ASSET_MS), headers: BROWSER_HEADERS });
+  checks.push({
+    id: "favicon",
+    label: "Favicon present & loads",
+    status: isOk(h) ? "pass" : "warn",
+    details: fav,
+  });
+} catch {
+  checks.push({ id: "favicon", label: "Favicon present & loads", status: "warn", details: "Unknown" });
+}
+
+// 5) Add your locked placeholders so UI shows teasers
+for (const id of OMIT_CHECKS) checks.push(LOCK_PLACEHOLDER(id));
+for (const id of ["h1-structure", "llms"]) checks.push(LOCK_PLACEHOLDER(id));
+
+// Return early with a clear "blocked" payload
+const payload = {
+  ok: true,
+  blocked: true,
+  url: rawUrl,
+  normalizedUrl,
+  finalUrl: finalUrlBlocked,
+  fetchedStatus: status,
+  timingMs: Date.now() - t0,
+  title: "",
+  checks,
+};
+if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
+return payload;
+
   }
+}
+
 
   // ---- Normal path ----
   const html = await pageRes.text();
@@ -883,6 +1004,7 @@ if (sitemapUrl) {
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
