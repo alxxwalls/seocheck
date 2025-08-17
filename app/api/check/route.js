@@ -1,5 +1,11 @@
 export const runtime = "edge";
 
+const UA_HEADERS = {
+  "user-agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+  "accept-language": "en-GB,en;q=0.9",
+};
+
 /** CORS */
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -98,7 +104,18 @@ export async function POST(req) {
 
     // 1) Fetch page
     const t0 = Date.now();
-    const pageRes = await fetch(normalizedUrl, { redirect: "follow" });
+    const to = withTimeout(12000);
+let pageRes;
+try {
+  pageRes = await fetch(normalizedUrl, {
+    redirect: "follow",
+    signal: to.signal,
+    headers: UA_HEADERS,
+    cache: "no-store",
+  });
+} finally {
+  to.done();
+}
     const html = await pageRes.text();
     const timingMs = Date.now() - t0;
     const finalUrl = pageRes.url;
@@ -438,3 +455,4 @@ export async function POST(req) {
     });
   }
 }
+
