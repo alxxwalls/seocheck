@@ -10,24 +10,38 @@ const UA_HEADERS = {
   "accept-language": "en-GB,en;q=0.9",
 };
 
-/** ---------- CORS ---------- */
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
+/** ---------- CORS (echo) ---------- */
+function corsHeadersFrom(req) {
+  const origin = req?.headers?.get("origin") || "*";
+  const reqHdrs = req?.headers?.get("access-control-request-headers") || "Content-Type";
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Vary": "Origin",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Headers": reqHdrs,
+    "Access-Control-Max-Age": "86400",
+  };
+}
 
-export async function OPTIONS() {
-  return new Response(null, { status: 204, headers: corsHeaders });
+export async function OPTIONS(req) {
+  return new Response(null, { status: 204, headers: corsHeadersFrom(req) });
 }
 
 // Health-check / connectivity "pong"
-export async function GET() {
+export async function GET(req) {
   return new Response(JSON.stringify({ ok: true, ping: "pong" }), {
     status: 200,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
+    headers: { ...corsHeadersFrom(req), "Content-Type": "application/json" },
   });
 }
+
+// Helper to return JSON with proper CORS
+const json = (req, status, body) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeadersFrom(req), "Content-Type": "application/json" },
+  });
+
 
 /** ---------- utils ---------- */
 const isOk = (res) => res && res.status >= 200 && res.status < 400;
@@ -124,12 +138,7 @@ export async function POST(req) {
   try {
     const body = await req.json().catch(() => ({}));
     const rawUrl = body?.url;
-    if (!rawUrl) {
-      return new Response(JSON.stringify({ ok: false, errors: ["Invalid URL"] }), {
-        status: 400,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
+    if (!rawUrl) return json(req, 400, { ok: false, errors: ["Invalid URL"] });
 
     const normalizedUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
 
@@ -621,3 +630,4 @@ export async function POST(req) {
     });
   }
 }
+
