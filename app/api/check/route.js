@@ -472,92 +472,172 @@ async function runAudit(req, rawUrl) {
   });
 
   /** -------- robots.txt -------- */
-  let robotsExists = false;
-  let robotsAllowsIndex = true;
-  let robotsSitemapListed = false;
-  if (timeLeft() > 250) {
+let robotsExists = false;
+let robotsAllowsIndex = true;
+let robotsSitemapListed = false;
+let robotsText = "";
+let robotsSitemaps = [];
+
+if (timeLeft() > 250) {
+  try {
+    const robotsURL = absUrl(origin + "/", "/robots.txt");
+    await timed("robots", async () => {
+      const r = await retry(async () => {
+        const tor = withTimeout(within(LIMITS.TIME_SMALL_MS));
+        try {
+          return await fetch(robotsURL, {
+            redirect: "follow",
+            signal: tor.signal,
+            headers: UA_HEADERS,
+            cache: "no-store",
+          });
+        } finally {
+          tor.done();
+        }
+      });
+      if (r.ok) {
+        robotsExists = true;
+        robotsText = await r.text();
+
+        // index allow/deny (simple check for User-agent: * + Disallow: /)
+        const blocks = robotsText.split(/(?=^User-agent:\s*)/gim);
+        const star = blocks.find((b) => /^User-agent:\s*\*/im.test(b)) || "";
+        if (/^\s*Disallow:\s*\/\s*$/im.test(star)) robotsAllowsIndex = false;
+
+        // extract explicit Sitemap: lines
+        const sitemapMatches = [...robotsText.matchAll(/^\s*Sitemap:\s*(\S+)\s*$/gim)];
+        robotsSitemaps = sitemapMatches
+          .map((m) => absUrl(robotsURL, m[1]))
+          .filter(Boolean);
+        robotsSitemapListed = robotsSitemaps.length > 0;
+      }
+    });
+  } catch {}
+}
+
+checks.push({
+  id: "robots",
+  label: "robots.txt allows indexing",
+  status: robotsExists ? (robotsAllowsIndex ? "pass" : "fail") : "warn",
+  details: robotsExists
+    ? `${robotsAllowsIndex ? "User-agent: * allowed" : "User-agent: * disallows /"}${
+        robotsSitemapListed ? ` • ${robotsSitemaps.length} sitemap URL(s) listed` : ""
+      }`
+    : "robots.txt not found",
+});
+
+
+ /** -------- sitemap.xml -------- */
+let sitemapUrl = null;
+let sitemapHasUrls = false;
+let sitemapSampleOk = 0;
+let sitemapGzipped = false;
+
+// common paths + robots.txt advertised URLs (unique)
+const commonPaths = [
+  "/sitemap.xml",
+  "/sitemap_index.xml",
+  "/sitemap-index.xml",
+  "/wp-sitemap.xml", // ← important for WordPress core
+];
+const candidateSet = new Set([
+  ...commonPaths.map((p) => absUrl(origin + "/", p)),
+  ...robotsSitemaps,
+]);
+const candidates = [...candidateSet].filter(Boolean);
+
+// find a reachable sitemap URL
+for (const u of candidates) {
+  if (timeLeft() < 250) break;
+  try {
+    await timed(`sitemap-head ${new URL(u).pathname}`, async () => {
+      const h = await tryHeadThenGet(u, { timeoutMs: within(LIMITS.TIME_SMALL_MS) });
+      if (isOk(h) && !sitemapUrl) {
+        sitemapUrl = u;
+        const ct = (h.headers.get("content-type") || "").toLowerCase();
+        sitemapGzipped =
+          /\.gz(\?|#|$)/i.test(u) ||
+          /application\/gzip|application\/x-gzip/i.test(ct);
+      }
+    });
+    if (sitemapUrl) break;
+  } catch {}
+}
+
+if (sitemapUrl) {
+  // If gzipped, don’t try to parse (Edge runtime lacks Node zlib); just report found.
+  if (sitemapGzipped) {
+    checks.push({
+      id: "sitemap",
+      label: "Sitemap exists & URLs valid",
+      status: "warn",
+      details: `Found gzipped sitemap: ${sitemapUrl} (content not parsed)`,
+    });
+  } else {
     try {
-      const robotsURL = absUrl(origin + "/", "/robots.txt");
-      await timed("robots", async () => {
+      await timed("sitemap-get", async () => {
         const r = await retry(async () => {
-          const tor = withTimeout(within(LIMITS.TIME_SMALL_MS));
+          const tos = withTimeout(within(LIMITS.TIME_PAGE_MS));
           try {
-            return await fetch(robotsURL, { redirect: "follow", signal: tor.signal, headers: UA_HEADERS, cache: "no-store" });
-          } finally { tor.done(); }
+            return await fetch(sitemapUrl, {
+              redirect: "follow",
+              signal: tos.signal,
+              headers: UA_HEADERS,
+              cache: "no-store",
+            });
+          } finally {
+            tos.done();
+          }
         });
         if (r.ok) {
-          robotsExists = true;
-          const text = await r.text();
-          const blocks = text.split(/(?=^User-agent:\s*)/gim);
-          const star = blocks.find((b) => /^User-agent:\s*\*/im.test(b)) || "";
-          if (/^\s*Disallow:\s*\/\s*$/im.test(star)) robotsAllowsIndex = false;
-          robotsSitemapListed = /(^|\n)\s*Sitemap:\s*https?:\/\//i.test(text);
+          const xml = await r.text();
+
+          // Works for both urlset and sitemapindex because we just gather all <loc> values
+          const locs = [...xml.matchAll(/<loc>([\s\S]*?)<\/loc>/gi)].map((m) =>
+            m[1].trim()
+          );
+          const absLocs = locs.map((h) => absUrl(sitemapUrl, h)).filter(Boolean);
+          sitemapHasUrls = absLocs.length > 0;
+
+          const toCheck = absLocs.slice(0, LIMITS.SITEMAP_SAMPLES);
+          const results = await Promise.all(
+            toCheck.map(async (u, i) => {
+              if (!spend() || timeLeft() < 200) return false;
+              try {
+                return await timed(`sitemap-sample-${i}`, async () => {
+                  const rr = await tryHeadThenGet(u, {
+                    timeoutMs: within(LIMITS.TIME_ASSET_MS),
+                  });
+                  return isOk(rr);
+                });
+              } catch {
+                return false;
+              }
+            })
+          );
+          sitemapSampleOk = results.filter(Boolean).length;
         }
       });
     } catch {}
+    checks.push({
+      id: "sitemap",
+      label: "Sitemap exists & URLs valid",
+      status:
+        sitemapHasUrls && sitemapSampleOk > 0 ? "pass" : "warn",
+      details: `Found: ${sitemapUrl} • URLs: ${
+        sitemapHasUrls ? "yes" : "no"
+      } • Valid samples: ${sitemapSampleOk}`,
+    });
   }
-  checks.push({
-    id: "robots",
-    label: "robots.txt allows indexing",
-    status: robotsExists ? (robotsAllowsIndex ? "pass" : "fail") : "warn",
-    details: robotsExists
-      ? `${robotsAllowsIndex ? "User-agent: * allowed" : "User-agent: * disallows /"}${robotsSitemapListed ? " • sitemap listed" : ""}`
-      : "robots.txt not found",
-  });
-
-  /** -------- sitemap.xml -------- */
-  let sitemapUrl = null, sitemapHasUrls = false, sitemapSampleOk = 0;
-  if (timeLeft() > 400) {
-    for (const p of ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml"]) {
-      const u = absUrl(origin + "/", p);
-      try {
-        await timed(`sitemap-head ${p}`, async () => {
-          const h = await tryHeadThenGet(u, { timeoutMs: within(LIMITS.TIME_SMALL_MS) });
-          if (isOk(h) && !sitemapUrl) sitemapUrl = u;
-        });
-        if (sitemapUrl) break;
-      } catch {}
-    }
-    if (sitemapUrl && timeLeft() > 600) {
-      try {
-        await timed("sitemap-get", async () => {
-          const r = await retry(async () => {
-            const tos = withTimeout(within(LIMITS.TIME_PAGE_MS));
-            try {
-              return await fetch(sitemapUrl, { redirect: "follow", signal: tos.signal, headers: UA_HEADERS, cache: "no-store" });
-            } finally { tos.done(); }
-          });
-          if (r.ok) {
-            const xml = await r.text();
-            const locs = [...xml.matchAll(/<loc>([\s\S]*?)<\/loc>/gi)].map((m) => m[1].trim());
-            const absLocs = locs.map((h) => absUrl(sitemapUrl, h)).filter(Boolean);
-            sitemapHasUrls = absLocs.length > 0;
-            const toCheck = absLocs.slice(0, LIMITS.SITEMAP_SAMPLES);
-            const results = await Promise.all(
-              toCheck.map(async (u, i) => {
-                if (!spend() || timeLeft() < 200) return false;
-                try {
-                  return await timed(`sitemap-sample-${i}`, async () => {
-                    const rr = await tryHeadThenGet(u, { timeoutMs: within(LIMITS.TIME_ASSET_MS) });
-                    return isOk(rr);
-                  });
-                } catch { return false; }
-              })
-            );
-            sitemapSampleOk = results.filter(Boolean).length;
-          }
-        });
-      } catch {}
-    }
-  }
+} else {
   checks.push({
     id: "sitemap",
     label: "Sitemap exists & URLs valid",
-    status: sitemapUrl ? (sitemapHasUrls && sitemapSampleOk > 0 ? "pass" : "warn") : "fail",
-    details: sitemapUrl
-      ? `Found: ${sitemapUrl} • URLs: ${sitemapHasUrls ? "yes" : "no"} • Valid samples: ${sitemapSampleOk}`
-      : "No sitemap found",
+    status: "fail",
+    details: `No sitemap found at common paths or in robots.txt`,
   });
+}
+
 
   /** -------- www ↔ non-www redirect -------- */
   let canonicalization = { tested: false, from: "", to: "", code: 0, good: false };
@@ -747,4 +827,5 @@ async function runAudit(req, rawUrl) {
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
