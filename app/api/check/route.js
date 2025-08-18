@@ -610,6 +610,7 @@ checks.push({
       fetchedStatus: 0,
       timingMs: OVERALL_BUDGET_MS,
       title,
+      metaTitle: title, 
       metaDescription: metaDesc, 
       speed: psi,
       checks,
@@ -781,6 +782,7 @@ const payload = {
   fetchedStatus: status,
   timingMs: Date.now() - t0,
   title: "",
+  metaTitle: title, 
   metaDescription: "",
   checks,
 };
@@ -1256,6 +1258,7 @@ checks.push({
     fetchedStatus: pageRes.status,
     timingMs,
     title,
+    metaTitle: title, 
     metaDescription: metaDesc,
     speed: psi,
     checks,
@@ -1263,6 +1266,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
