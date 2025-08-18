@@ -1,5 +1,6 @@
 // app/api/check/route.js
 // export const runtime = "nodejs";
+import { put } from "@vercel/blob";
 export const runtime = "edge";
 
 /** ---------- polite request headers ---------- */
@@ -95,43 +96,23 @@ function makeId() {
 
 // Save snapshot (POST so Vercel picks the final key) and return the server-confirmed path+url
 async function saveSnapshot(payload) {
+  const BLOB_TOKEN =
+    process.env.BLOB_READ_WRITE_TOKEN ||
+    process.env.BLOB_READ_WRITE_TOKEN_READ_WRITE_TOKEN ||
+    "";
+
   if (!BLOB_TOKEN) throw new Error("Missing BLOB token");
 
-  const filename = `${makeId()}.json`; // seed; server will append a random suffix
-
-  const res = await fetch(BLOB_WRITE_BASE, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${BLOB_TOKEN}`,
-      "Content-Type": "application/json",
-      "x-vercel-blob-version": "5",
-      "x-vercel-blob-add-random-suffix": "1", // <-- suffix only honored on POST
-      "x-vercel-blob-filename": filename,     // <-- tell server the base name
-    },
-    body: JSON.stringify(payload),
+  const seed = `${makeId()}.json`;
+  const blob = await put(seed, JSON.stringify(payload), {
+    access: "public",
+    contentType: "application/json",
+    addRandomSuffix: true, // ensures the server appends the random suffix
+    token: BLOB_TOKEN,     // you’re using a custom var name, so pass it explicitly
   });
 
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`Blob save failed (${res.status}) ${t}`);
-  }
-
-  const data = await res.json().catch(() => ({}));
-
-  // Vercel responds with the final values — always trust these
-  const shareBlobPath = data?.pathname; // e.g. "/abc123...-RQyGjkXg....json"
-  const shareBlobUrl  = data?.url;      // e.g. "https://<public-host>/abc123...-....json"
-
-  if (!shareBlobPath || !shareBlobUrl) {
-    // Defensive fallback (older responses)
-    const path = `/${filename}`;
-    return {
-      shareBlobPath: path,
-      shareBlobUrl: `${BLOB_PUBLIC_BASE}/${path.replace(/^\/+/, "")}`,
-    };
-  }
-
-  return { shareBlobPath, shareBlobUrl };
+  // Server returns the final values including the random suffix
+  return { shareBlobPath: blob.pathname, shareBlobUrl: blob.url };
 }
 
 
@@ -1279,6 +1260,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
