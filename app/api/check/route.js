@@ -781,6 +781,7 @@ const payload = {
   fetchedStatus: status,
   timingMs: Date.now() - t0,
   title: "",
+  metaDescription: "",
   checks,
 };
 if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
@@ -1262,6 +1263,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
