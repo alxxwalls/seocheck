@@ -12,6 +12,7 @@
     "react-dom": "18.2.0",
     "@vercel/blob": "latest",
     "@react-pdf/renderer": "^3.4.0",
+    "pdf-lib": "^1.17.1",
     "resend": "^3.3.0"
   },
   "devDependencies": {
@@ -20,6 +21,7 @@
     "@types/node": "^20.12.12"
   }
 }
+
 
 
 
