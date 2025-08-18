@@ -100,23 +100,17 @@ async function saveSnapshot(id, payload) {
   if (!BLOB_TOKEN) throw new Error("Missing BLOB_READ_WRITE_TOKEN");
   const res = await fetch(`${BLOB_WRITE_BASE}/${id}.json`, {
     method: "PUT",
-    headers: {
-      Authorization: `Bearer ${BLOB_TOKEN}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${BLOB_TOKEN}`, "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-
   const text = await res.text().catch(() => "");
   let meta = {};
   try { meta = JSON.parse(text || "{}"); } catch {}
 
-  if (!res.ok) {
-    throw new Error(`Blob save failed (${res.status}) ${text?.slice(0,200) || ""}`);
-  }
+  if (!res.ok) throw new Error(`Blob save failed (${res.status}) ${text?.slice(0,200) || ""}`);
 
-  const pathname = normPathname(meta.pathname || `${id}.json`);
-  const publicUrl = meta.url || joinUrl(BLOB_PUBLIC_BASE, pathname);
+  const pathname = (meta.pathname || `${id}.json`).replace(/^\/+/, "");
+  const publicUrl = meta.url || `${BLOB_PUBLIC_BASE.replace(/\/+$/,"")}/${pathname}`;
   return { id, pathname, publicUrl };
 }
 
@@ -268,7 +262,7 @@ if (snapId) {
   }
 }
 
-/** ---------- POST ---------- */
+// ---------- POST ----------
 export async function POST(req) {
   try {
     const body = await req.json().catch(() => ({}));
@@ -278,7 +272,6 @@ export async function POST(req) {
 
     if (!rawUrl) return json(req, 400, { ok: false, errors: ["Invalid URL"] });
 
-    // Use cache only for normal runs (not when explicitly snapshotting)
     const key = normalizeKey(rawUrl);
     if (!noCache && !wantSnapshot) {
       const hit = cacheGet(key);
@@ -291,40 +284,31 @@ export async function POST(req) {
     const out = await runAudit(req, rawUrl);
     const { _diag, ...copy } = out;
 
-    // Cache normal successful runs
     if (!copy.blocked && !copy.timeout && !wantSnapshot) cacheSet(key, copy);
 
-    // Snapshot mode: persist to Blob + return share id/url
-if (wantSnapshot) {
-  const shareId = makeId();
-  const saved = await saveSnapshot(shareId, copy); // { id, pathname, publicUrl }
+    if (wantSnapshot) {
+      const id = makeId();
+      // ⬇️ get the blob pathname & public URL from the write response
+      const { pathname, publicUrl } = await saveSnapshot(id, copy);
 
-  const base =
-    process.env.SHARE_BASE /* e.g. https://lekker.marketing/seo-check */ ||
-    (() => {
-      try {
-        const u = new URL(req.url);
-        // fall back to the page hosting your widget if you want, else just origin:
-        return u.origin;
-      } catch {
-        return "";
-      }
-    })();
+      // build your on-site share link using ?blob=<pathname>
+      const base = process.env.SHARE_BASE || (() => {
+        try { const u = new URL(req.url); return `${u.origin}${u.pathname.replace(/\/api\/check\/?$/, "")}`; } catch { return ""; }
+      })();
 
-  const shareUrl = base
-    ? `${base}?blob=${encodeURIComponent(saved.pathname)}`
-    : undefined;
+      const shareUrl = base ? `${base}?blob=${encodeURIComponent(pathname)}` : undefined;
 
-  return json(req, 200, {
-    ok: true,
-    ...copy,
-    shareId,
-    blobPath: saved.pathname,
-    publicUrl: saved.publicUrl,
-    ...(shareUrl && { shareUrl }),
-  });
-}
-    // Normal response
+      return json(req, 200, {
+        ok: true,
+        ...copy,
+        // for debugging / flexibility:
+        shareId: id,
+        shareBlobPath: pathname,   // e.g. "a3006...-RQyGj....json"
+        shareBlobUrl: publicUrl,   // full public blob URL
+        ...(shareUrl && { shareUrl })
+      });
+    }
+
     return json(req, 200, { ...copy, _diag });
   } catch (e) {
     const msg = e?.message || "Unknown error";
@@ -1256,6 +1240,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
