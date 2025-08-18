@@ -301,39 +301,49 @@ export async function POST(req) {
     const out = await runAudit(req, rawUrl);
     const { _diag, ...copy } = out;
 
-    if (!copy.blocked && !copy.timeout && !wantSnapshot) cacheSet(key, copy);
+    if (!copy.blocked && !copy.timeout && !wantSnapshot) {
+      cacheSet(key, copy);
+    }
 
     // Snapshot mode: persist to Blob + return share blob path/url
-if (wantSnapshot) {
-  const { shareBlobUrl, shareBlobPath } = await saveSnapshot(copy);
+    if (wantSnapshot) {
+      const { shareBlobUrl, shareBlobPath } = await saveSnapshot(copy);
 
-  // Build a human share link to your page with ?blob=<path-or-url>
-  const base =
-    process.env.SHARE_BASE ||
-    (() => {
-      try {
-        const u = new URL(req.url);
-        // This returns "/api/check" -> so use u.origin and your public route.
-        // If you host the widget at /seo-check:
-        return `${u.origin}/seo-check`;
-      } catch {
-        return "";
-      }
-    })();
+      // Build a human share link to your page with ?blob=<path-or-url>
+      const base =
+        process.env.SHARE_BASE ||
+        (() => {
+          try {
+            const u = new URL(req.url);
+            // If your public widget lives at /seo-check:
+            return `${u.origin}/seo-check`;
+          } catch {
+            return "";
+          }
+        })();
 
-  const shareUrl =
-    base && shareBlobPath
-      ? `${base}?blob=${encodeURIComponent(shareBlobPath)}`
-      : "";
+      const shareUrl =
+        base && shareBlobPath
+          ? `${base}?blob=${encodeURIComponent(shareBlobPath)}`
+          : "";
 
-  return json(req, 200, {
-    ok: true,
-    ...copy,
-    shareBlobPath, // e.g. "/a30068...-RQyGjkXgEpz5zCQ5OqnPJ4JnaFrrig.json"
-    shareBlobUrl,  // full absolute URL (public blob)
-    ...(shareUrl && { shareUrl }),
-  });
+      return json(req, 200, {
+        ok: true,
+        ...copy,
+        shareBlobPath, // e.g. "/a30068…-RQyGjkXg….json"
+        shareBlobUrl,  // full absolute URL
+        ...(shareUrl && { shareUrl }),
+      });
+    }
+
+    // Normal (non-snapshot) response
+    return json(req, 200, { ...copy, _diag });
+  } catch (e) {
+    const msg = e?.message || "Unknown error";
+    return json(req, 500, { ok: false, errors: [msg] });
+  }
 }
+
 
 /** ---------- utils ---------- */
 const isOk = (res) => res && res.status >= 200 && res.status < 400;
@@ -1258,3 +1268,4 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
