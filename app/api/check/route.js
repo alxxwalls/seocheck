@@ -73,13 +73,11 @@ const LOCK_PLACEHOLDER = (id) => ({
 const BLOB_WRITE_BASE = "https://blob.vercel-storage.com"; // write API
 const BLOB_PUBLIC_BASE =
   process.env.BLOB_PUBLIC_BASE ||
-  "https://fqnbg6i9weauas3p.public.blob.vercel-storage.com"; // <-- your store's public host
+  "https://fqnbg6i9weauas3p.public.blob.vercel-storage.com"; // your store's public host
 
-// tolerate the misnamed token env var
 const BLOB_TOKEN =
   process.env.BLOB_READ_WRITE_TOKEN ||
-  process.env.BLOB_READ_WRITE_TOKEN_READ_WRITE_TOKEN ||
-  "";
+  process.env.BLOB_READ_WRITE_TOKEN_READ_WRITE_TOKEN || "";
 
 // single ID generator
 function makeId() {
@@ -88,7 +86,7 @@ function makeId() {
   return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// write JSON to Blob (private write host)
+// write JSON to Blob (returns final public url & pathname)
 async function saveSnapshot(id, payload) {
   if (!BLOB_TOKEN) throw new Error("Missing BLOB_READ_WRITE_TOKEN");
   const res = await fetch(`${BLOB_WRITE_BASE}/${id}.json`, {
@@ -99,32 +97,28 @@ async function saveSnapshot(id, payload) {
     },
     body: JSON.stringify(payload),
   });
+
+  const bodyText = await res.text().catch(() => "");
+  let json = {};
+  try { json = JSON.parse(bodyText || "{}"); } catch {}
+
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Blob save failed (${res.status}) ${text}`);
+    throw new Error(`Blob save failed (${res.status}) ${bodyText?.slice(0, 200) || ""}`);
   }
-  return id;
+
+  // Vercel returns { url, pathname, ... } where pathname includes the suffix
+  const pathname = json?.pathname || `${id}.json`; // e.g. a3..23-RQyG..rig.json
+  const publicUrl = json?.url || `${BLOB_PUBLIC_BASE}/${pathname}`;
+  return { id, pathname, publicUrl };
 }
 
-// read JSON from Blob (public read host)
-async function loadSnapshot(id) {
-  const url = `${BLOB_PUBLIC_BASE}/${id}.json`;
+// read JSON from Blob (by exact pathname on public host)
+async function loadSnapshotByPath(pathname) {
+  const url = `${BLOB_PUBLIC_BASE}/${pathname}`;
   const r = await fetch(url, { cache: "no-store" });
   if (!r.ok) return null;
   return await r.json();
 }
-
-// optional: verify public readability right after save
-async function verifyPublicRead(id) {
-  const url = `${BLOB_PUBLIC_BASE}/${id}.json`;
-  try {
-    const r = await fetch(url, { method: "HEAD", cache: "no-store" });
-    return { url, ok: r.ok, status: r.status };
-  } catch (e) {
-    return { url, ok: false, status: 0, error: String(e?.message || e) };
-  }
-}
-
 
 /** ---------- CORS (dynamic echo) ---------- */
 function corsHeadersFrom(req) {
@@ -214,19 +208,27 @@ function snapshotGet(id) {
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
 
-  // Snapshot fetch path
-  const snapId = searchParams.get("id");
-  if (snapId) {
-    const snap = await loadSnapshot(snapId);
-    if (snap) {
-      return json(req, 200, { ...snap, ok: true, fromSnapshot: true, shareId: snapId });
-    }
-    // optional debug echo
-    const debugInfo = searchParams.get("debug") ? {
-      attemptedUrl: `${BLOB_PUBLIC_BASE}/${snapId}.json`
-    } : undefined;
-    return json(req, 404, { ok: false, errors: ["Snapshot not found"], ...(debugInfo || {}) });
-  }
+  // Snapshot load by explicit blob pathname (preferred)
+const blobPath = searchParams.get("blob");
+if (blobPath) {
+  const snap = await loadSnapshotByPath(blobPath);
+  if (snap) return json(req, 200, { ...snap, ok: true, fromSnapshot: true, blob: blobPath });
+  return json(req, 404, { ok: false, errors: ["Snapshot not found (blob)"], attempted: `${BLOB_PUBLIC_BASE}/${blobPath}` });
+}
+
+// Legacy: load by plain id (may fail if suffix present)
+const snapId = searchParams.get("id");
+if (snapId) {
+  // try naive path; many stores fingerprint names so this can 404
+  const snap = await loadSnapshotByPath(`${snapId}.json`);
+  if (snap) return json(req, 200, { ...snap, ok: true, fromSnapshot: true, shareId: snapId });
+  return json(req, 404, {
+    ok: false,
+    errors: ["Snapshot not found (id). This store fingerprints filenames."],
+    hint: "Regenerate a link so it uses ?blob=<fingerprinted-pathname>",
+    attempted: `${BLOB_PUBLIC_BASE}/${snapId}.json`,
+  });
+}
 
   
   const rawUrl = searchParams.get("url");
@@ -281,29 +283,28 @@ export async function POST(req) {
 
     // Snapshot mode: persist to Blob + return share id/url
 if (wantSnapshot) {
-      const shareId = makeId();
-      await saveSnapshot(shareId, copy);                 // write → blob
-      const probe = await verifyPublicRead(shareId);     // sanity check
+  const shareId = makeId();
+  const saved = await saveSnapshot(shareId, copy); // { id, pathname, publicUrl }
 
-      // compute a share URL (prefer env; else current origin)
-      const base =
-        process.env.SHARE_BASE ||
-        (() => {
-          try { const u = new URL(req.url); return `${u.origin}/`; }
-          catch { return ""; }
-        })();
-      const shareUrl = base ? `${base}?id=${shareId}` : undefined;
+  const base =
+    process.env.SHARE_BASE ||
+    (() => {
+      try { const u = new URL(req.url); return `${u.origin}${u.pathname.replace(/\/api\/check\/?$/, "")}`; }
+      catch { return ""; }
+    })();
 
-      return json(req, 200, {
-        ok: true,
-        ...copy,
-        shareId,
-        ...(shareUrl && { shareUrl }),
-        // include probe for debugging (harmless to keep)
-        _publicProbe: probe
-      });
-    }
+  // Build a link that your widget/page can open directly (uses blob=…)
+  const shareUrl = base ? `${base}?blob=${encodeURIComponent(saved.pathname)}` : undefined;
 
+  return json(req, 200, {
+    ok: true,
+    ...copy,
+    shareId,                // still returned if you want to show it
+    blobPath: saved.pathname, // the exact public pathname
+    publicUrl: saved.publicUrl, // direct public URL (for debugging)
+    ...(shareUrl && { shareUrl }),
+  });
+}
     // Normal response
     return json(req, 200, { ...copy, _diag });
   } catch (e) {
@@ -1236,6 +1237,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
