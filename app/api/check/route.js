@@ -98,14 +98,14 @@ function makeId() {
 async function saveSnapshot(payload) {
   if (!BLOB_TOKEN) throw new Error("Missing BLOB token");
 
-  const name = `${makeId()}.json`; // base name; Vercel will append a random suffix
-  const res = await fetch(`${BLOB_WRITE_BASE}/${name}`, {
+  const baseKey = `${makeId()}.json`; // provisional name; server may append suffix
+  const res = await fetch(`${BLOB_WRITE_BASE}/${baseKey}`, {
     method: "PUT",
     headers: {
       Authorization: `Bearer ${BLOB_TOKEN}`,
       "Content-Type": "application/json",
-      // version header is fine; Vercel currently accepts without too
       "x-vercel-blob-version": "5",
+      "x-vercel-blob-add-random-suffix": "1", // <-- IMPORTANT
     },
     body: JSON.stringify(payload),
   });
@@ -115,10 +115,10 @@ async function saveSnapshot(payload) {
     throw new Error(`Blob save failed (${res.status}) ${t}`);
   }
 
-  // IMPORTANT: read back the final stored path with the random suffix
   const data = await res.json().catch(() => ({}));
-  const shareBlobUrl = data?.url;       // absolute URL
-  const shareBlobPath = data?.pathname; // "/<key-with-random-suffix>.json" (leading slash)
+  // Vercel returns both; prefer the server-confirmed pathname
+  const shareBlobPath = data?.pathname || `/${baseKey}`; // leading slash
+  const shareBlobUrl  = data?.url || `${BLOB_PUBLIC_BASE}/${shareBlobPath.replace(/^\/+/, "")}`;
 
   if (!shareBlobPath) throw new Error("Blob save returned no pathname");
   return { shareBlobUrl, shareBlobPath };
@@ -1268,4 +1268,5 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
