@@ -1178,7 +1178,7 @@ checks.push({
   checks.push({
     id: "title-length",
     label: "Title length",
-    status: titleLen ? (titleLen >= 15 && titleLen <= 60 ? "pass" : "warn") : "fail",
+    status: titleLen ? (titleLen >= 25 && titleLen <= 60 ? "pass" : "warn") : "fail",
     details: titleLen ? `${titleLen} chars` : "Missing",
   });
 
@@ -1266,6 +1266,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
