@@ -78,52 +78,73 @@ function normPathname(p) {
   return String(p || "").replace(/^\/+/, "");
 }
 
-// =================== Blob config & helpers ===================
-const BLOB_WRITE_BASE = "https://blob.vercel-storage.com"; // write API
+// ---- Blob config ----
+const BLOB_WRITE_BASE = "https://blob.vercel-storage.com"; // write endpoint
 const BLOB_PUBLIC_BASE =
   process.env.BLOB_PUBLIC_BASE ||
-  "https://fqnbg6i9weauas3p.public.blob.vercel-storage.com"; // your store's public host
-
+  "https://fqnbg6i9weauas3p.public.blob.vercel-storage.com"; // <-- your public host
 const BLOB_TOKEN =
   process.env.BLOB_READ_WRITE_TOKEN ||
   process.env.BLOB_READ_WRITE_TOKEN_READ_WRITE_TOKEN || "";
 
-// single ID generator
+// One ID generator (keep only one in file)
 function makeId() {
   const a = new Uint8Array(12);
   crypto.getRandomValues(a);
   return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// write JSON to Blob (returns final public url & pathname)
-async function saveSnapshot(id, payload) {
-  if (!BLOB_TOKEN) throw new Error("Missing BLOB_READ_WRITE_TOKEN");
-  const res = await fetch(`${BLOB_WRITE_BASE}/${id}.json`, {
+// Save snapshot and RETURN THE ACTUAL STORED KEY!
+async function saveSnapshot(payload) {
+  if (!BLOB_TOKEN) throw new Error("Missing BLOB token");
+
+  const name = `${makeId()}.json`; // base name; Vercel will append a random suffix
+  const res = await fetch(`${BLOB_WRITE_BASE}/${name}`, {
     method: "PUT",
-    headers: { Authorization: `Bearer ${BLOB_TOKEN}`, "Content-Type": "application/json" },
+    headers: {
+      Authorization: `Bearer ${BLOB_TOKEN}`,
+      "Content-Type": "application/json",
+      // version header is fine; Vercel currently accepts without too
+      "x-vercel-blob-version": "5",
+    },
     body: JSON.stringify(payload),
   });
-  const text = await res.text().catch(() => "");
-  let meta = {};
-  try { meta = JSON.parse(text || "{}"); } catch {}
 
-  if (!res.ok) throw new Error(`Blob save failed (${res.status}) ${text?.slice(0,200) || ""}`);
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Blob save failed (${res.status}) ${t}`);
+  }
 
-  const pathname = (meta.pathname || `${id}.json`).replace(/^\/+/, "");
-  const publicUrl = meta.url || `${BLOB_PUBLIC_BASE.replace(/\/+$/,"")}/${pathname}`;
-  return { id, pathname, publicUrl };
+  // IMPORTANT: read back the final stored path with the random suffix
+  const data = await res.json().catch(() => ({}));
+  const shareBlobUrl = data?.url;       // absolute URL
+  const shareBlobPath = data?.pathname; // "/<key-with-random-suffix>.json" (leading slash)
+
+  if (!shareBlobPath) throw new Error("Blob save returned no pathname");
+  return { shareBlobUrl, shareBlobPath };
 }
 
-async function loadSnapshotByPath(pathlike) {
-  const pathOrUrl = decodeURIComponent(String(pathlike || ""));
-  const url = /^https?:\/\//i.test(pathOrUrl)
+// Load by full URL OR by path (with/without leading slash)
+async function loadSnapshotByPath(pathOrUrl) {
+  const isAbs = typeof pathOrUrl === "string" && pathOrUrl.includes("://");
+  const url = isAbs
     ? pathOrUrl
-    : joinUrl(BLOB_PUBLIC_BASE, normPathname(pathOrUrl));
+    : `${BLOB_PUBLIC_BASE}/${String(pathOrUrl).replace(/^\/+/, "")}`;
 
   const r = await fetch(url, { cache: "no-store" });
-  if (!r.ok) return { ok: false, attempted: url };
-  return { ok: true, data: await r.json() };
+  if (!r.ok) {
+    return {
+      ok: false,
+      error: `Blob fetch failed (${r.status})`,
+      attempted: url,
+    };
+  }
+  const json = await r.json().catch(() => null);
+  return json
+    ? { ok: true, json }
+    : { ok: false, error: "Blob JSON parse failed", attempted: url };
 }
+
 
 /** ---------- CORS (dynamic echo) ---------- */
 function corsHeadersFrom(req) {
@@ -211,31 +232,27 @@ function snapshotGet(id) {
 
 /** ---------- GET ---------- */
 export async function GET(req) {
-const { searchParams } = new URL(req.url);
+  const { searchParams } = new URL(req.url);
 
-// Preferred: blob pathname
-const blobParam = searchParams.get("blob");
-if (blobParam) {
-  const snap = await loadSnapshotByPath(blobParam);
-  if (snap?.ok) {
-    return json(req, 200, { ok: true, fromSnapshot: true, blob: normPathname(blobParam), ...snap.data });
+  // Prefer new ?blob=... (full URL or path); keep old ?id=... as legacy
+  const blobParam = searchParams.get("blob");
+  if (blobParam) {
+    const out = await loadSnapshotByPath(blobParam);
+    if (out.ok) return json(req, 200, { ...out.json, fromSnapshot: true, shareBlobPath: blobParam });
+    return json(req, 404, { ok: false, errors: ["Snapshot not found (blob)"], attempted: out.attempted });
   }
-  return json(req, 404, { ok: false, errors: ["Snapshot not found (blob)"], attempted: snap?.attempted });
-}
 
-// Legacy: id (may 404 if store fingerprints names)
-const snapId = searchParams.get("id");
-if (snapId) {
-  const snap = await loadSnapshotByPath(`${snapId}.json`);
-  if (snap?.ok) {
-    return json(req, 200, { ok: true, fromSnapshot: true, shareId: snapId, ...snap.data });
+  // Legacy ?id=... (try both "<id>.json" and bare "<id>")
+  const snapId = searchParams.get("id");
+  if (snapId) {
+    const try1 = await loadSnapshotByPath(`${snapId}.json`);
+    if (try1.ok) return json(req, 200, { ...try1.json, fromSnapshot: true, shareId: snapId });
+
+    const try2 = await loadSnapshotByPath(snapId);
+    if (try2.ok) return json(req, 200, { ...try2.json, fromSnapshot: true, shareId: snapId });
+
+    return json(req, 404, { ok: false, errors: ["Snapshot not found (id)"], attempted: [try1.attempted, try2.attempted].filter(Boolean) });
   }
-  return json(req, 404, {
-    ok: false,
-    errors: ["Snapshot not found (id). This store fingerprints filenames."],
-    attempted: snap?.attempted
-  });
-}
 
   
   const rawUrl = searchParams.get("url");
@@ -286,36 +303,37 @@ export async function POST(req) {
 
     if (!copy.blocked && !copy.timeout && !wantSnapshot) cacheSet(key, copy);
 
-    if (wantSnapshot) {
-      const id = makeId();
-      // ⬇️ get the blob pathname & public URL from the write response
-      const { pathname, publicUrl } = await saveSnapshot(id, copy);
+    // Snapshot mode: persist to Blob + return share blob path/url
+if (wantSnapshot) {
+  const { shareBlobUrl, shareBlobPath } = await saveSnapshot(copy);
 
-      // build your on-site share link using ?blob=<pathname>
-      const base = process.env.SHARE_BASE || (() => {
-        try { const u = new URL(req.url); return `${u.origin}${u.pathname.replace(/\/api\/check\/?$/, "")}`; } catch { return ""; }
-      })();
+  // Build a human share link to your page with ?blob=<path-or-url>
+  const base =
+    process.env.SHARE_BASE ||
+    (() => {
+      try {
+        const u = new URL(req.url);
+        // This returns "/api/check" -> so use u.origin and your public route.
+        // If you host the widget at /seo-check:
+        return `${u.origin}/seo-check`;
+      } catch {
+        return "";
+      }
+    })();
 
-      const shareUrl = base ? `${base}?blob=${encodeURIComponent(pathname)}` : undefined;
+  const shareUrl =
+    base && shareBlobPath
+      ? `${base}?blob=${encodeURIComponent(shareBlobPath)}`
+      : "";
 
-      return json(req, 200, {
-        ok: true,
-        ...copy,
-        // for debugging / flexibility:
-        shareId: id,
-        shareBlobPath: pathname,   // e.g. "a3006...-RQyGj....json"
-        shareBlobUrl: publicUrl,   // full public blob URL
-        ...(shareUrl && { shareUrl })
-      });
-    }
-
-    return json(req, 200, { ...copy, _diag });
-  } catch (e) {
-    const msg = e?.message || "Unknown error";
-    return json(req, 500, { ok: false, errors: [msg] });
-  }
+  return json(req, 200, {
+    ok: true,
+    ...copy,
+    shareBlobPath, // e.g. "/a30068...-RQyGjkXgEpz5zCQ5OqnPJ4JnaFrrig.json"
+    shareBlobUrl,  // full absolute URL (public blob)
+    ...(shareUrl && { shareUrl }),
+  });
 }
-
 
 /** ---------- utils ---------- */
 const isOk = (res) => res && res.status >= 200 && res.status < 400;
@@ -1240,6 +1258,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
