@@ -79,59 +79,6 @@ function normPathname(p) {
   return String(p || "").replace(/^\/+/, "");
 }
 
-//iOS copying util
-
-const isiOS = typeof navigator !== "undefined" && /iPad|iPhone|iPod/.test(navigator.userAgent);
-
-async function copyTextSmart(text) {
-  const tryExecCommand = () => {
-    try {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.setAttribute("readonly", "");
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      ta.style.left = "-9999px";
-      document.body.appendChild(ta);
-      ta.focus();
-      ta.select();
-      const ok = document.execCommand("copy");
-      document.body.removeChild(ta);
-      return ok;
-    } catch {
-      return false;
-    }
-  };
-
-  // iOS: prefer native share sheet first (user can tap “Copy”)
-  if (typeof navigator !== "undefined" && navigator.share && isiOS) {
-    try {
-      await navigator.share({ url: text });
-      return true;
-    } catch { /* fall through */ }
-  }
-
-  // Clipboard API
-  if (navigator?.clipboard?.writeText) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch { /* fall through to execCommand */ }
-  }
-
-  // Fallback
-  if (tryExecCommand()) return true;
-
-  // Last resort: manual copy prompt
-  try {
-    window.prompt("Copy this link:", text);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-
 // ---- Blob config ----
 const BLOB_WRITE_BASE = "https://blob.vercel-storage.com"; // write endpoint
 const BLOB_PUBLIC_BASE =
@@ -1313,6 +1260,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
