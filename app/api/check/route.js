@@ -72,8 +72,6 @@ const LOCK_PLACEHOLDER = (id) => ({
 const BLOB_BASE = "https://blob.vercel-storage.com";
 const BLOB_TOKEN = process.env.BLOB_READ_WRITE_TOKEN;
 
-const makeId = () => Math.random().toString(36).slice(2, 8);
-
 async function saveSnapshot(id, payload) {
   if (!BLOB_TOKEN) return null;
   const res = await fetch(`${BLOB_BASE}/${id}.json`, {
@@ -146,7 +144,7 @@ function cacheSet(key, payload) {
   CACHE.set(key, { payload, createdAt: now, expiresAt: now + CACHE_TTL_MS });
 }
 
-/** ---------- snapshots (in-memory, ephemeral) ---------- */
+/** ---------- snapshots (in-memory, ephemeral) ---------- 
 const SNAP_TTL_MS = parseInt(process.env.SNAPSHOT_TTL_MS || "1209600000", 10); // 14 days
 const SNAPSHOTS = new Map(); // id -> { payload, createdAt, expiresAt }
 
@@ -171,7 +169,7 @@ function snapshotGet(id) {
     return null;
   }
   return rec;
-}
+}*/
 
 
 /** ---------- GET ---------- */
@@ -237,12 +235,18 @@ export async function POST(req) {
     if (!copy.blocked && !copy.timeout && !wantSnapshot) cacheSet(key, copy);
 
     // Snapshot mode: save + return share id/url
-    if (wantSnapshot) {
-      const shareId = snapshotSet(copy);
-      const base = process.env.SHARE_BASE; // e.g., "https://lekker.marketing/seo-audit"
-      const shareUrl = base ? `${base}?id=${shareId}` : undefined;
-      return json(req, 200, { ...copy, shareId, ...(shareUrl && { shareUrl }) });
-    }
+if (wantSnapshot) {
+  const shareId = makeId();
+  try {
+    await saveSnapshot(shareId, copy); // persist to Vercel Blob
+  } catch (err) {
+    return json(req, 500, { ok: false, errors: ["Snapshot save failed"] });
+  }
+  const base = process.env.SHARE_BASE; // e.g., "https://yourdomain.com/seo-audit"
+  const shareUrl = base ? `${base}?id=${shareId}` : undefined;
+  return json(req, 200, { ...copy, shareId, ...(shareUrl && { shareUrl }) });
+}
+
 
     // Normal response
     return json(req, 200, { ...copy, _diag });
@@ -1176,6 +1180,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
