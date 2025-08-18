@@ -1257,4 +1257,4 @@ checks.push({
   };
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
-};
+}
