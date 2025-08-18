@@ -250,29 +250,16 @@ export async function POST(req) {
     // Cache normal successful runs
     if (!copy.blocked && !copy.timeout && !wantSnapshot) cacheSet(key, copy);
 
-    // Snapshot mode: save + return share id/url
+    // Snapshot mode: persist to Blob + return share id/url
 if (wantSnapshot) {
-  if (!BLOB_TOKEN) {
-    return json(req, 500, {
-      ok: false,
-      errors: ["Snapshots disabled: BLOB_READ_WRITE_TOKEN_READ_WRITE_TOKEN not configured"],
-    });
-  }
-
   const shareId = makeId();
-  try {
-    await saveSnapshot(shareId, copy); // persist to Vercel Blob
-  } catch (e) {
-    return json(req, 500, { ok: false, errors: ["Snapshot save failed"] });
-  }
+  await saveSnapshot(shareId, copy);   // <-- write to Blob
 
-  const base = process.env.SHARE_BASE; // e.g. "https://yourdomain.com/seo-audit"
+  const base = process.env.SHARE_BASE; // e.g. "https://your-site.com/seo-check"
   const shareUrl = base ? `${base}?id=${shareId}` : undefined;
 
-  return json(req, 200, { ok: true, ...copy, shareId, ...(shareUrl && { shareUrl }) });
+  return json(req, 200, { ...copy, shareId, ...(shareUrl && { shareUrl }) });
 }
-
-
 
     // Normal response
     return json(req, 200, { ...copy, _diag });
@@ -1206,6 +1193,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
