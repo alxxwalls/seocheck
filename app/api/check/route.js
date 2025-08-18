@@ -69,6 +69,15 @@ const LOCK_PLACEHOLDER = (id) => ({
   locked: true,
 });
 
+function joinUrl(base, path) {
+  const b = String(base || "").replace(/\/+$/, "");
+  const p = String(path || "").replace(/^\/+/, "");
+  return `${b}/${p}`;
+}
+function normPathname(p) {
+  return String(p || "").replace(/^\/+/, "");
+}
+
 // =================== Blob config & helpers ===================
 const BLOB_WRITE_BASE = "https://blob.vercel-storage.com"; // write API
 const BLOB_PUBLIC_BASE =
@@ -98,26 +107,28 @@ async function saveSnapshot(id, payload) {
     body: JSON.stringify(payload),
   });
 
-  const bodyText = await res.text().catch(() => "");
-  let json = {};
-  try { json = JSON.parse(bodyText || "{}"); } catch {}
+  const text = await res.text().catch(() => "");
+  let meta = {};
+  try { meta = JSON.parse(text || "{}"); } catch {}
 
   if (!res.ok) {
-    throw new Error(`Blob save failed (${res.status}) ${bodyText?.slice(0, 200) || ""}`);
+    throw new Error(`Blob save failed (${res.status}) ${text?.slice(0,200) || ""}`);
   }
 
-  // Vercel returns { url, pathname, ... } where pathname includes the suffix
-  const pathname = json?.pathname || `${id}.json`; // e.g. a3..23-RQyG..rig.json
-  const publicUrl = json?.url || `${BLOB_PUBLIC_BASE}/${pathname}`;
+  const pathname = normPathname(meta.pathname || `${id}.json`);
+  const publicUrl = meta.url || joinUrl(BLOB_PUBLIC_BASE, pathname);
   return { id, pathname, publicUrl };
 }
 
-// read JSON from Blob (by exact pathname on public host)
-async function loadSnapshotByPath(pathname) {
-  const url = `${BLOB_PUBLIC_BASE}/${pathname}`;
+async function loadSnapshotByPath(pathlike) {
+  const pathOrUrl = decodeURIComponent(String(pathlike || ""));
+  const url = /^https?:\/\//i.test(pathOrUrl)
+    ? pathOrUrl
+    : joinUrl(BLOB_PUBLIC_BASE, normPathname(pathOrUrl));
+
   const r = await fetch(url, { cache: "no-store" });
-  if (!r.ok) return null;
-  return await r.json();
+  if (!r.ok) return { ok: false, attempted: url };
+  return { ok: true, data: await r.json() };
 }
 
 /** ---------- CORS (dynamic echo) ---------- */
@@ -206,27 +217,29 @@ function snapshotGet(id) {
 
 /** ---------- GET ---------- */
 export async function GET(req) {
-  const { searchParams } = new URL(req.url);
+const { searchParams } = new URL(req.url);
 
-  // Snapshot load by explicit blob pathname (preferred)
-const blobPath = searchParams.get("blob");
-if (blobPath) {
-  const snap = await loadSnapshotByPath(blobPath);
-  if (snap) return json(req, 200, { ...snap, ok: true, fromSnapshot: true, blob: blobPath });
-  return json(req, 404, { ok: false, errors: ["Snapshot not found (blob)"], attempted: `${BLOB_PUBLIC_BASE}/${blobPath}` });
+// Preferred: blob pathname
+const blobParam = searchParams.get("blob");
+if (blobParam) {
+  const snap = await loadSnapshotByPath(blobParam);
+  if (snap?.ok) {
+    return json(req, 200, { ok: true, fromSnapshot: true, blob: normPathname(blobParam), ...snap.data });
+  }
+  return json(req, 404, { ok: false, errors: ["Snapshot not found (blob)"], attempted: snap?.attempted });
 }
 
-// Legacy: load by plain id (may fail if suffix present)
+// Legacy: id (may 404 if store fingerprints names)
 const snapId = searchParams.get("id");
 if (snapId) {
-  // try naive path; many stores fingerprint names so this can 404
   const snap = await loadSnapshotByPath(`${snapId}.json`);
-  if (snap) return json(req, 200, { ...snap, ok: true, fromSnapshot: true, shareId: snapId });
+  if (snap?.ok) {
+    return json(req, 200, { ok: true, fromSnapshot: true, shareId: snapId, ...snap.data });
+  }
   return json(req, 404, {
     ok: false,
     errors: ["Snapshot not found (id). This store fingerprints filenames."],
-    hint: "Regenerate a link so it uses ?blob=<fingerprinted-pathname>",
-    attempted: `${BLOB_PUBLIC_BASE}/${snapId}.json`,
+    attempted: snap?.attempted
   });
 }
 
@@ -287,21 +300,27 @@ if (wantSnapshot) {
   const saved = await saveSnapshot(shareId, copy); // { id, pathname, publicUrl }
 
   const base =
-    process.env.SHARE_BASE ||
+    process.env.SHARE_BASE /* e.g. https://lekker.marketing/seo-check */ ||
     (() => {
-      try { const u = new URL(req.url); return `${u.origin}${u.pathname.replace(/\/api\/check\/?$/, "")}`; }
-      catch { return ""; }
+      try {
+        const u = new URL(req.url);
+        // fall back to the page hosting your widget if you want, else just origin:
+        return u.origin;
+      } catch {
+        return "";
+      }
     })();
 
-  // Build a link that your widget/page can open directly (uses blob=…)
-  const shareUrl = base ? `${base}?blob=${encodeURIComponent(saved.pathname)}` : undefined;
+  const shareUrl = base
+    ? `${base}?blob=${encodeURIComponent(saved.pathname)}`
+    : undefined;
 
   return json(req, 200, {
     ok: true,
     ...copy,
-    shareId,                // still returned if you want to show it
-    blobPath: saved.pathname, // the exact public pathname
-    publicUrl: saved.publicUrl, // direct public URL (for debugging)
+    shareId,
+    blobPath: saved.pathname,
+    publicUrl: saved.publicUrl,
     ...(shareUrl && { shareUrl }),
   });
 }
@@ -1237,6 +1256,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
