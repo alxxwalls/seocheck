@@ -121,7 +121,7 @@ module.exports = async (req, res) => {
 
     const resend = new Resend(process.env.RESEND_API_KEY);
     await resend.emails.send({
-      from: "SEO Audit <audit@yourdomain.com>", // configure in Resend
+      from: "SEO Audit <onboarding@resend.dev>", // configure in Resend
       to: email,
       subject: `Your SEO audit for ${payload.host || payload.url}`,
       text: `Attached is your SEO audit PDF.\nOnline view: ${payload.shareUrl || payload.url}`,
