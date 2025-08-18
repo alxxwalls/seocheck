@@ -609,7 +609,8 @@ checks.push({
       finalUrl: normalizedUrl,
       fetchedStatus: 0,
       timingMs: OVERALL_BUDGET_MS,
-      title: "",
+      title,
+      metaDescription: metaDesc, 
       speed: psi,
       checks,
     };
@@ -1254,12 +1255,14 @@ checks.push({
     fetchedStatus: pageRes.status,
     timingMs,
     title,
+    metaDescription: metaDesc,
     speed: psi,
     checks,
   };
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
