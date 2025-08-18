@@ -144,6 +144,14 @@ function cacheSet(key, payload) {
   CACHE.set(key, { payload, createdAt: now, expiresAt: now + CACHE_TTL_MS });
 }
 
+// ID generator (24 hex chars)
+function makeId() {
+  const a = new Uint8Array(12);
+  crypto.getRandomValues(a);
+  return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+
 /** ---------- snapshots (in-memory, ephemeral) ---------- 
 const SNAP_TTL_MS = parseInt(process.env.SNAPSHOT_TTL_MS || "1209600000", 10); // 14 days
 const SNAPSHOTS = new Map(); // id -> { payload, createdAt, expiresAt }
@@ -1180,6 +1188,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
