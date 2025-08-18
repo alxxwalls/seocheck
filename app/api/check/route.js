@@ -84,8 +84,7 @@ const BLOB_PUBLIC_BASE =
   process.env.BLOB_PUBLIC_BASE ||
   "https://fqnbg6i9weauas3p.public.blob.vercel-storage.com"; // <-- your public host
 const BLOB_TOKEN =
-  process.env.BLOB_READ_WRITE_TOKEN ||
-  process.env.BLOB_READ_WRITE_TOKEN_READ_WRITE_TOKEN || "";
+   process.env.BLOB_READ_WRITE_TOKEN_READ_WRITE_TOKEN || "";
 
 // One ID generator (keep only one in file)
 function makeId() {
@@ -94,18 +93,20 @@ function makeId() {
   return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// Save snapshot and RETURN THE ACTUAL STORED KEY!
+// Save snapshot (POST so Vercel picks the final key) and return the server-confirmed path+url
 async function saveSnapshot(payload) {
   if (!BLOB_TOKEN) throw new Error("Missing BLOB token");
 
-  const baseKey = `${makeId()}.json`; // provisional name; server may append suffix
-  const res = await fetch(`${BLOB_WRITE_BASE}/${baseKey}`, {
-    method: "PUT",
+  const filename = `${makeId()}.json`; // seed; server will append a random suffix
+
+  const res = await fetch(BLOB_WRITE_BASE, {
+    method: "POST",
     headers: {
       Authorization: `Bearer ${BLOB_TOKEN}`,
       "Content-Type": "application/json",
       "x-vercel-blob-version": "5",
-      "x-vercel-blob-add-random-suffix": "1", // <-- IMPORTANT
+      "x-vercel-blob-add-random-suffix": "1", // <-- suffix only honored on POST
+      "x-vercel-blob-filename": filename,     // <-- tell server the base name
     },
     body: JSON.stringify(payload),
   });
@@ -116,13 +117,23 @@ async function saveSnapshot(payload) {
   }
 
   const data = await res.json().catch(() => ({}));
-  // Vercel returns both; prefer the server-confirmed pathname
-  const shareBlobPath = data?.pathname || `/${baseKey}`; // leading slash
-  const shareBlobUrl  = data?.url || `${BLOB_PUBLIC_BASE}/${shareBlobPath.replace(/^\/+/, "")}`;
 
-  if (!shareBlobPath) throw new Error("Blob save returned no pathname");
-  return { shareBlobUrl, shareBlobPath };
+  // Vercel responds with the final values — always trust these
+  const shareBlobPath = data?.pathname; // e.g. "/abc123...-RQyGjkXg....json"
+  const shareBlobUrl  = data?.url;      // e.g. "https://<public-host>/abc123...-....json"
+
+  if (!shareBlobPath || !shareBlobUrl) {
+    // Defensive fallback (older responses)
+    const path = `/${filename}`;
+    return {
+      shareBlobPath: path,
+      shareBlobUrl: `${BLOB_PUBLIC_BASE}/${path.replace(/^\/+/, "")}`,
+    };
+  }
+
+  return { shareBlobPath, shareBlobUrl };
 }
+
 
 // Load by full URL OR by path (with/without leading slash)
 async function loadSnapshotByPath(pathOrUrl) {
@@ -1268,5 +1279,6 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
