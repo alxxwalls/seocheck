@@ -1,174 +1,319 @@
 // /app/api/send-pdf/route.js
-export const runtime = "nodejs"
+export const runtime = "nodejs"; // ensure Node runtime (Buffer, etc.)
+export const dynamic = "force-dynamic";
 
-import { NextResponse } from "next/server"
-import { Resend } from "resend"
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib"
-
-// (same helpers as above) — START
-const resend = new Resend(process.env.RESEND_API_KEY)
-const FROM = process.env.FROM_EMAIL || "onboarding@resend.dev"
-const BCC = process.env.MARKETING_BCC || ""
-const CATS = { SEO:["sitemap","robots","favicon","opengraph","canonical","noindex","meta-robots","meta-description","title-length","viewport","www-canonical","img-alt","structured-data","h1-structure","llms"], PERFORMANCE:["timeout","psi","ttfb","img-modern","img-size","img-lazy","compression"], SECURITY:["blocked","http","https-redirect","mixed-content","security-headers"] }
-const LOCKED = new Set(["h1-structure","llms","mixed-content","security-headers","compression","structured-data","https-redirect"])
-const asString = (v, f = "") => (typeof v === "string" ? v : f)
-const pickUrl = (p={}) => asString(p.finalUrl) || asString(p.normalizedUrl) || asString(p.url) || asString(p.targetUrl)
-const parseHost = (u) => { try { return new URL(u).host } catch { return "" } }
-const nowPretty = () => new Date().toLocaleString("en-GB", { day:"2-digit", month:"short", year:"numeric", hour:"2-digit", minute:"2-digit" })
-function counts(checks = [], ids = []) { const usable = ids.filter(id => !LOCKED.has(id)); const byId = Object.fromEntries((checks||[]).map(c => [c.id, c])); const present = usable.map(id => byId[id]).filter(Boolean); const passed = present.filter(c => String(c.status).toLowerCase() === "pass").length; return { passed, total: usable.length } }
-function keyIssues(checks = [], limit = 14) { const bad = (checks||[]).filter(c => String(c.status).toLowerCase() !== "pass"); const rank = s => (s==="fail" ? 0 : s==="warn" ? 1 : 2); bad.sort((a,b) => rank(String(a.status).toLowerCase()) - rank(String(b.status).toLowerCase())); return bad.slice(0, limit) }
-
-async function buildPdf(payload) {
-  const url = pickUrl(payload)
-  const host = parseHost(url) || payload.host || ""
-  const title = asString(payload.metaTitle) || asString(payload.title) || ""
-  const description = asString(payload.metaDescription) || ""
-  const overall = Number.isFinite(payload.overall) ? payload.overall : null
-  const catScores = payload.catScores && typeof payload.catScores === "object" ? payload.catScores : null
-  const checks = Array.isArray(payload.checks) ? payload.checks : []
-
-  const seoCnt = counts(checks, CATS.SEO)
-  const perfCnt = counts(checks, CATS.PERFORMANCE)
-  const secCnt = counts(checks, CATS.SECURITY)
-
-  const doc = await PDFDocument.create()
-  let page = doc.addPage()
-  let { width, height } = page.getSize()
-  const margin = 50
-  let y = height - margin
-
-  const fontBold = await doc.embedFont(StandardFonts.HelveticaBold)
-  const fontReg = await doc.embedFont(StandardFonts.Helvetica)
-
-  const drawText = (text, { x = margin, size = 12, color = rgb(0,0,0), font = fontReg } = {}) => {
-    page.drawText(String(text ?? ""), { x, y, size, color, font })
-  }
-  const newPageIfNeeded = () => {
-    if (y < margin + 60) {
-      page = doc.addPage()
-      ;({ width, height } = page.getSize())
-      y = height - margin
-    }
-  }
-  const wrap = (text, { x = margin, size = 12, font = fontReg, maxWidth = width - margin*2, lh = 1.35 } = {}) => {
-    const words = String(text ?? "").split(/\s+/).filter(Boolean)
-    let line = ""
-    for (const w of words) {
-      const t = line ? line + " " + w : w
-      if (font.widthOfTextAtSize(t, size) > maxWidth && line) {
-        drawText(line, { x, size, font })
-        y -= size * lh
-        newPageIfNeeded()
-        line = w
-      } else {
-        line = t
-      }
-    }
-    if (line) { drawText(line, { x, size, font }); y -= size * lh; newPageIfNeeded() }
-  }
-
-  // Header
-  drawText(`SEO Audit — ${host || "Site"}`, { size: 20, font: fontBold })
-  y -= 26
-  drawText(url || "—", { size: 11, color: rgb(0.25,0.25,0.25) })
-  y -= 18
-  drawText(nowPretty(), { size: 10, color: rgb(0.45,0.45,0.45) })
-  y -= 20
-  page.drawLine({ start:{x:margin,y}, end:{x:width-margin,y}, thickness:1, color: rgb(0.9,0.9,0.92) })
-  y -= 16
-
-  // Meta
-  if (title || description) {
-    drawText("Meta", { size: 13, font: fontBold })
-    y -= 16
-    if (title) { drawText("Title:", { size: 11, font: fontBold }); y -= 14; wrap(title, { size: 11 }); y -= 6 }
-    if (description) { drawText("Description:", { size: 11, font: fontBold }); y -= 14; wrap(description, { size: 11 }); y -= 6 }
-    page.drawLine({ start:{x:margin,y}, end:{x:width-margin,y}, thickness:1, color: rgb(0.9,0.9,0.92) })
-    y -= 16
-  }
-
-  // Scores
-  drawText("Scores", { size: 13, font: fontBold })
-  y -= 16
-  if (overall !== null) { drawText(`Overall: ${overall}/100`); y -= 16 }
-  if (catScores && (catScores.SEO != null || catScores.PERFORMANCE != null || catScores.SECURITY != null)) {
-    const fmt = v => (typeof v === "number" ? Math.round(v*100) + "/100" : "—")
-    drawText(`SEO: ${fmt(catScores.SEO)}    Performance: ${fmt(catScores.PERFORMANCE)}    Security: ${fmt(catScores.SECURITY)}`)
-    y -= 18
-  } else {
-    drawText(`SEO: ${seoCnt.passed}/${seoCnt.total}    Performance: ${perfCnt.passed}/${perfCnt.total}    Security: ${secCnt.passed}/${secCnt.total}`)
-    y -= 18
-  }
-  page.drawLine({ start:{x:margin,y}, end:{x:width-margin,y}, thickness:1, color: rgb(0.9,0.9,0.92) })
-  y -= 16
-
-  // Key findings
-  drawText("Key findings", { size: 13, font: fontBold })
-  y -= 16
-  const issues = keyIssues(checks, 14)
-  if (!issues.length) { drawText("All checks passed or no issues to show."); y -= 14 }
-  else {
-    for (const c of issues) {
-      drawText(`• ${c.id} — ${String(c.status).toUpperCase()}`, { font: fontBold })
-      y -= 14
-      if (c.details) { wrap(String(c.details).slice(0, 400), { size: 11 }) }
-      y -= 6; newPageIfNeeded()
-    }
-  }
-
-  // Footer
-  page.drawLine({ start:{x:margin,y}, end:{x:width-margin,y}, thickness:1, color: rgb(0.9,0.9,0.92) })
-  y -= 14
-  drawText("Generated by your SEO checker", { size: 9, color: rgb(0.5,0.5,0.55) })
-
-  return await doc.save()
-}
-// (helpers) — END
-
-const cors = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-}
-
-export async function OPTIONS() {
-  return new NextResponse(null, { status: 200, headers: cors })
-}
+/**
+ * Expected request JSON (fields are flexible; send what you have):
+ * {
+ *   "email": "user@example.com",                  // required
+ *   "url": "https://example.com",                 // required
+ *   "metaTitle": "Meta title here",               // optional
+ *   "metaDescription": "Meta description here",   // optional
+ *   "score": 87,                                  // optional (0..100)
+ *   "categories": {                               // optional
+ *     "SEO": { "passed": 7, "total": 10 },
+ *     "PERFORMANCE": { "passed": 3, "total": 5 },
+ *     "SECURITY": { "passed": 2, "total": 3 }
+ *   },
+ *   "checks": [                                   // optional
+ *     { "id": "sitemap", "status": "pass", "label": "Sitemap.xml", "details": "" },
+ *     { "id": "canonical", "status": "fail", "label": "Canonical tag", "details": "Missing or wrong URL" }
+ *   ],
+ *   "shareUrl": "https://yoursite.com/audit?blob=..." // optional
+ * }
+ */
 
 export async function POST(req) {
   try {
-    const { email, payload } = await req.json()
-    if (!email || !payload) {
-      return NextResponse.json({ ok:false, errors:["Missing email or payload"] }, { status: 400, headers: cors })
+    const body = await req.json().catch(() => ({}));
+    const {
+      email,
+      url,
+      metaTitle,
+      metaDescription,
+      score,
+      categories = {},
+      checks = [],
+      shareUrl,
+    } = body || {};
+
+    if (!email || !url) {
+      return json({ ok: false, errors: ["Missing email or url"] }, 400);
     }
 
-    const pdfBytes = await buildPdf(payload)
-    const url = pickUrl(payload)
-    const host = parseHost(url)
-    const subject = `Your SEO audit for ${host || url || "your site"}`
-    const text = `Hi,\n\nAttached is the PDF of your SEO audit for ${url || host || "your site"}.\n\nThanks!`
+    // Use server-only dynamic import for pdf-lib
+    const { PDFDocument, StandardFonts, rgb } = await import("pdf-lib");
+    const { Resend } = await import("resend");
 
-    const input = {
-      from: FROM,
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    const from = process.env.FROM_EMAIL;
+
+    if (!process.env.RESEND_API_KEY) {
+      return json({ ok: false, errors: ["RESEND_API_KEY not set"] }, 500);
+    }
+    if (!from) {
+      return json({ ok: false, errors: ["FROM_EMAIL not set"] }, 500);
+    }
+
+    // --- Build PDF (A4 portrait) ---
+    const pdfDoc = await PDFDocument.create();
+    const page = pdfDoc.addPage([595.28, 841.89]); // A4 in points
+    const { width, height } = page.getSize();
+
+    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const bold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+    const margin = 40;
+    const contentWidth = width - margin * 2;
+    let cursorY = height - margin;
+
+    const drawText = (text, opts = {}) => {
+      const {
+        x = margin,
+        y = cursorY,
+        size = 12,
+        color = rgb(0.12, 0.12, 0.12),
+        f = font,
+      } = opts;
+      page.drawText(String(text ?? ""), { x, y, size, font: f, color });
+    };
+
+    const newPage = () => {
+      const p = pdfDoc.addPage([595.28, 841.89]);
+      cursorY = p.getSize().height - margin;
+      return p;
+    };
+
+    const ensureRoom = (needed = 16) => {
+      if (cursorY - needed < margin) {
+        // start new page
+        const p = newPage();
+        return p;
+      }
+      return page;
+    };
+
+    const wrapAndDraw = (text, size = 12, f = font, lineGap = 4) => {
+      if (!text) return;
+      const words = String(text).split(/\s+/);
+      let line = "";
+      const maxWidth = contentWidth;
+
+      const widthOf = (t) => f.widthOfTextAtSize(t, size);
+
+      for (let i = 0; i < words.length; i++) {
+        const test = line ? `${line} ${words[i]}` : words[i];
+        if (widthOf(test) > maxWidth) {
+          ensureRoom(size + lineGap);
+          drawText(line, { size, f });
+          cursorY -= size + lineGap;
+          line = words[i];
+        } else {
+          line = test;
+        }
+      }
+      if (line) {
+        ensureRoom(size + lineGap);
+        drawText(line, { size, f });
+        cursorY -= size + lineGap;
+      }
+    };
+
+    // Header
+    const host = (() => {
+      try {
+        return new URL(url).hostname;
+      } catch {
+        return url;
+      }
+    })();
+
+    drawText("SEO Audit", { size: 22, f: bold, color: rgb(0, 0, 0) });
+    cursorY -= 26;
+
+    drawText(host, { size: 14, color: rgb(0.2, 0.2, 0.2) });
+    cursorY -= 18;
+
+    drawText(url, { size: 10, color: rgb(0.35, 0.35, 0.35) });
+    cursorY -= 18;
+
+    if (typeof score === "number") {
+      drawText(`Overall score: ${score}`, {
+        size: 14,
+        f: bold,
+        color: rgb(0.12, 0.45, 0.18),
+      });
+      cursorY -= 18;
+    }
+
+    // Categories line
+    const catLine = [
+      categories.SEO
+        ? `SEO ${categories.SEO.passed}/${categories.SEO.total ?? 0}`
+        : null,
+      categories.PERFORMANCE
+        ? `PERF ${categories.PERFORMANCE.passed}/${categories.PERFORMANCE.total ?? 0}`
+        : null,
+      categories.SECURITY
+        ? `SEC ${categories.SECURITY.passed}/${categories.SECURITY.total ?? 0}`
+        : null,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    if (catLine) {
+      drawText(catLine, { size: 11, color: rgb(0.35, 0.35, 0.35), f: bold });
+      cursorY -= 16;
+    }
+
+    // Divider
+    ensureRoom(12);
+    page.drawLine({
+      start: { x: margin, y: cursorY },
+      end: { x: width - margin, y: cursorY },
+      thickness: 1,
+      color: rgb(0.92, 0.94, 0.96),
+    });
+    cursorY -= 14;
+
+    // Meta Title
+    if (metaTitle) {
+      drawText("Meta title", {
+        size: 11,
+        f: bold,
+        color: rgb(0.3, 0.3, 0.3),
+      });
+      cursorY -= 14;
+      wrapAndDraw(metaTitle, 12, bold);
+    }
+
+    // Meta Description
+    if (metaDescription) {
+      cursorY -= 6;
+      drawText("Meta description", {
+        size: 11,
+        f: bold,
+        color: rgb(0.3, 0.3, 0.3),
+      });
+      cursorY -= 14;
+      wrapAndDraw(metaDescription, 12, font);
+    }
+
+    // Divider
+    ensureRoom(18);
+    page.drawLine({
+      start: { x: margin, y: cursorY },
+      end: { x: width - margin, y: cursorY },
+      thickness: 1,
+      color: rgb(0.92, 0.94, 0.96),
+    });
+    cursorY -= 16;
+
+    // Top Issues (fails then warns)
+    const fails = checks.filter((c) => c?.status === "fail").slice(0, 10);
+    const warns = checks.filter((c) => c?.status === "warn").slice(0, 10);
+
+    const drawIssueList = (title, items) => {
+      if (!items.length) return;
+      drawText(title, { size: 12, f: bold });
+      cursorY -= 16;
+      for (const c of items) {
+        ensureRoom(28);
+        // bullet
+        page.drawCircle({
+          x: margin + 4,
+          y: cursorY + 6,
+          size: 2.2,
+          color: rgb(0.15, 0.15, 0.15),
+        });
+        // label
+        drawText(c.label || c.id || "Check", {
+          x: margin + 12,
+          size: 12,
+          f: bold,
+        });
+        cursorY -= 14;
+        if (c.details) {
+          wrapAndDraw(String(c.details), 11, font, 3);
+        } else {
+          cursorY -= 2;
+        }
+      }
+      cursorY -= 6;
+    };
+
+    if (fails.length || warns.length) {
+      drawIssueList("Failed checks", fails);
+      drawIssueList("Warnings", warns);
+    }
+
+    // Snapshot link
+    if (shareUrl) {
+      ensureRoom(18);
+      drawText("Snapshot link:", { size: 11, f: bold });
+      cursorY -= 14;
+      wrapAndDraw(shareUrl, 11, font);
+    }
+
+    const pdfBytes = await pdfDoc.save();
+    const pdfBuffer = Buffer.from(pdfBytes);
+
+    // --- Send email via Resend ---
+    const subject = `Your SEO audit for ${host}`;
+    const html = `
+      <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+        <p>Hi! Attached is your PDF audit for <a href="${escapeHtml(
+          url
+        )}">${escapeHtml(url)}</a>.</p>
+        ${
+          shareUrl
+            ? `<p>You can also view the snapshot here: <a href="${escapeHtml(
+                shareUrl
+              )}">${escapeHtml(shareUrl)}</a></p>`
+            : ""
+        }
+        <p>Thanks for using the SEO checker!</p>
+      </div>
+    `;
+
+    await resend.emails.send({
+      from,
       to: email,
       subject,
-      text,
-      attachments: [{
-        filename: "seo-audit.pdf",
-        content: Buffer.from(pdfBytes).toString("base64"),
-        contentType: "application/pdf",
-      }],
-    }
-    if (BCC) input.bcc = BCC
+      html,
+      attachments: [
+        {
+          filename: `seo-audit-${sanitizeFilename(host)}.pdf`,
+          content: pdfBuffer,
+        },
+      ],
+    });
 
-    const out = await resend.emails.send(input)
-    if (out?.error) {
-      return NextResponse.json({ ok:false, errors:[String(out.error)] }, { status: 502, headers: cors })
-    }
-
-    return NextResponse.json({ ok:true }, { status: 200, headers: cors })
+    return json({ ok: true });
   } catch (e) {
-    console.error("send-pdf error:", e)
-    return NextResponse.json({ ok:false, errors:[e?.message || "Unknown error"] }, { status: 500, headers: cors })
+    console.error("[send-pdf] error:", e);
+    return json(
+      { ok: false, errors: [e?.message || "Internal server error"] },
+      500
+    );
   }
+}
+
+/* ---------------- helpers ---------------- */
+
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function sanitizeFilename(name = "audit") {
+  return String(name).replace(/[^\w.-]+/g, "_").slice(0, 80) || "audit";
+}
+
+function escapeHtml(s = "") {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
