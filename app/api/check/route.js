@@ -69,22 +69,26 @@ const LOCK_PLACEHOLDER = (id) => ({
   locked: true,
 });
 
-// ---- Blob config ----
-const BLOB_WRITE_BASE = "https://blob.vercel-storage.com"; // API host (write, needs token)
+// =================== Blob config & helpers ===================
+const BLOB_WRITE_BASE = "https://blob.vercel-storage.com"; // write API
 const BLOB_PUBLIC_BASE =
-  process.env.BLOB_PUBLIC_BASE || "https://fqnbg6i9weauas3p.public.blob.vercel-storage.com"; // <- your host
+  process.env.BLOB_PUBLIC_BASE ||
+  "https://fqnbg6i9weauas3p.public.blob.vercel-storage.com"; // <-- your store's public host
+
+// tolerate the misnamed token env var
 const BLOB_TOKEN =
   process.env.BLOB_READ_WRITE_TOKEN ||
-  process.env.BLOB_READ_WRITE_TOKEN_READ_WRITE_TOKEN || ""; // tolerate the accidental var name
+  process.env.BLOB_READ_WRITE_TOKEN_READ_WRITE_TOKEN ||
+  "";
 
-// One ID generator only
+// single ID generator
 function makeId() {
   const a = new Uint8Array(12);
   crypto.getRandomValues(a);
   return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// Save to Blob (write host + Bearer)
+// write JSON to Blob (private write host)
 async function saveSnapshot(id, payload) {
   if (!BLOB_TOKEN) throw new Error("Missing BLOB_READ_WRITE_TOKEN");
   const res = await fetch(`${BLOB_WRITE_BASE}/${id}.json`, {
@@ -95,17 +99,30 @@ async function saveSnapshot(id, payload) {
     },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) throw new Error(`Blob save failed (${res.status})`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Blob save failed (${res.status}) ${text}`);
+  }
   return id;
 }
 
-// Load from Blob (public host, no auth)
+// read JSON from Blob (public read host)
 async function loadSnapshot(id) {
-  const r = await fetch(`${BLOB_PUBLIC_BASE}/${id}.json`, {
-    cache: "no-store",
-  });
+  const url = `${BLOB_PUBLIC_BASE}/${id}.json`;
+  const r = await fetch(url, { cache: "no-store" });
   if (!r.ok) return null;
   return await r.json();
+}
+
+// optional: verify public readability right after save
+async function verifyPublicRead(id) {
+  const url = `${BLOB_PUBLIC_BASE}/${id}.json`;
+  try {
+    const r = await fetch(url, { method: "HEAD", cache: "no-store" });
+    return { url, ok: r.ok, status: r.status };
+  } catch (e) {
+    return { url, ok: false, status: 0, error: String(e?.message || e) };
+  }
 }
 
 
@@ -197,20 +214,19 @@ function snapshotGet(id) {
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
 
-  // 1) Snapshot load
-const snapId = searchParams.get("id");
-if (snapId) {
-  const snap = await loadSnapshot(snapId);
-  if (snap) {
-    return json(req, 200, {
-      ok: true,
-      ...snap,
-      fromSnapshot: true,
-      shareId: snapId,
-    });
+  // Snapshot fetch path
+  const snapId = searchParams.get("id");
+  if (snapId) {
+    const snap = await loadSnapshot(snapId);
+    if (snap) {
+      return json(req, 200, { ...snap, ok: true, fromSnapshot: true, shareId: snapId });
+    }
+    // optional debug echo
+    const debugInfo = searchParams.get("debug") ? {
+      attemptedUrl: `${BLOB_PUBLIC_BASE}/${snapId}.json`
+    } : undefined;
+    return json(req, 404, { ok: false, errors: ["Snapshot not found"], ...(debugInfo || {}) });
   }
-  return json(req, 404, { ok: false, errors: ["Snapshot not found"] });
-}
 
   
   const rawUrl = searchParams.get("url");
@@ -266,21 +282,26 @@ export async function POST(req) {
     // Snapshot mode: persist to Blob + return share id/url
 if (wantSnapshot) {
       const shareId = makeId();
-      await saveSnapshot(shareId, copy); // <-- write to Blob
+      await saveSnapshot(shareId, copy);                 // write → blob
+      const probe = await verifyPublicRead(shareId);     // sanity check
 
+      // compute a share URL (prefer env; else current origin)
       const base =
         process.env.SHARE_BASE ||
         (() => {
-          try {
-            const u = new URL(req.url);
-            return `${u.origin}/`; // fallback to current origin
-          } catch {
-            return "";
-          }
+          try { const u = new URL(req.url); return `${u.origin}/`; }
+          catch { return ""; }
         })();
-
       const shareUrl = base ? `${base}?id=${shareId}` : undefined;
-      return json(req, 200, { ok: true, ...copy, shareId, ...(shareUrl && { shareUrl }) });
+
+      return json(req, 200, {
+        ok: true,
+        ...copy,
+        shareId,
+        ...(shareUrl && { shareUrl }),
+        // include probe for debugging (harmless to keep)
+        _publicProbe: probe
+      });
     }
 
     // Normal response
@@ -1215,6 +1236,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
