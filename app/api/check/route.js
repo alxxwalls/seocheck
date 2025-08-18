@@ -70,7 +70,7 @@ const LOCK_PLACEHOLDER = (id) => ({
 });
 
 const BLOB_BASE = "https://blob.vercel-storage.com";
-const BLOB_TOKEN = process.env.BLOB_READ_WRITE_TOKEN;
+const BLOB_TOKEN = process.env.BLOB_READ_WRITE_TOKEN_READ_WRITE_TOKEN;
 
 async function saveSnapshot(id, payload) {
   if (!BLOB_TOKEN) return null;
@@ -185,12 +185,20 @@ export async function GET(req) {
   const { searchParams } = new URL(req.url);
 
   // 1) Snapshot load
-  const snapId = searchParams.get("id");
-  if (snapId) {
-    const snap = await loadSnapshot(snapId);
-    if (snap) return json(req, 200, { ...snap, fromSnapshot: true, shareId: snapId });
-    return json(req, 404, { ok: false, errors: ["Snapshot not found"] });
+const snapId = searchParams.get("id");
+if (snapId) {
+  const snap = await loadSnapshot(snapId);
+  if (snap) {
+    return json(req, 200, {
+      ok: true,
+      ...snap,
+      fromSnapshot: true,
+      shareId: snapId,
+    });
   }
+  return json(req, 404, { ok: false, errors: ["Snapshot not found"] });
+}
+
   
   const rawUrl = searchParams.get("url");
   if (!rawUrl) return json(req, 200, { ok: true, ping: "pong" });
@@ -244,16 +252,26 @@ export async function POST(req) {
 
     // Snapshot mode: save + return share id/url
 if (wantSnapshot) {
+  if (!BLOB_TOKEN) {
+    return json(req, 500, {
+      ok: false,
+      errors: ["Snapshots disabled: BLOB_READ_WRITE_TOKEN_READ_WRITE_TOKEN not configured"],
+    });
+  }
+
   const shareId = makeId();
   try {
     await saveSnapshot(shareId, copy); // persist to Vercel Blob
-  } catch (err) {
+  } catch (e) {
     return json(req, 500, { ok: false, errors: ["Snapshot save failed"] });
   }
-  const base = process.env.SHARE_BASE; // e.g., "https://yourdomain.com/seo-audit"
+
+  const base = process.env.SHARE_BASE; // e.g. "https://yourdomain.com/seo-audit"
   const shareUrl = base ? `${base}?id=${shareId}` : undefined;
-  return json(req, 200, { ...copy, shareId, ...(shareUrl && { shareUrl }) });
+
+  return json(req, 200, { ok: true, ...copy, shareId, ...(shareUrl && { shareUrl }) });
 }
+
 
 
     // Normal response
@@ -1188,6 +1206,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
