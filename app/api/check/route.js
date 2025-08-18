@@ -69,32 +69,45 @@ const LOCK_PLACEHOLDER = (id) => ({
   locked: true,
 });
 
-const BLOB_BASE = "https://blob.vercel-storage.com";
-const BLOB_TOKEN = process.env.BLOB_READ_WRITE_TOKEN_READ_WRITE_TOKEN;
+// ---- Blob config ----
+const BLOB_WRITE_BASE = "https://blob.vercel-storage.com"; // API host (write, needs token)
+const BLOB_PUBLIC_BASE =
+  process.env.BLOB_PUBLIC_BASE || "https://fqnbg6i9weauas3p.public.blob.vercel-storage.com"; // <- your host
+const BLOB_TOKEN =
+  process.env.BLOB_READ_WRITE_TOKEN ||
+  process.env.BLOB_READ_WRITE_TOKEN_READ_WRITE_TOKEN || ""; // tolerate the accidental var name
 
+// One ID generator only
+function makeId() {
+  const a = new Uint8Array(12);
+  crypto.getRandomValues(a);
+  return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Save to Blob (write host + Bearer)
 async function saveSnapshot(id, payload) {
-  if (!BLOB_TOKEN) return null;
-  const res = await fetch(`${BLOB_BASE}/${id}.json`, {
+  if (!BLOB_TOKEN) throw new Error("Missing BLOB_READ_WRITE_TOKEN");
+  const res = await fetch(`${BLOB_WRITE_BASE}/${id}.json`, {
     method: "PUT",
     headers: {
-      "Authorization": `Bearer ${BLOB_TOKEN}`,
+      Authorization: `Bearer ${BLOB_TOKEN}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) throw new Error("Blob save failed");
+  if (!res.ok) throw new Error(`Blob save failed (${res.status})`);
   return id;
 }
 
+// Load from Blob (public host, no auth)
 async function loadSnapshot(id) {
-  if (!BLOB_TOKEN) return null;
-  const r = await fetch(`${BLOB_BASE}/${id}.json`, {
-    headers: { "Authorization": `Bearer ${BLOB_TOKEN}` },
+  const r = await fetch(`${BLOB_PUBLIC_BASE}/${id}.json`, {
     cache: "no-store",
   });
   if (!r.ok) return null;
   return await r.json();
 }
+
 
 /** ---------- CORS (dynamic echo) ---------- */
 function corsHeadersFrom(req) {
@@ -252,14 +265,23 @@ export async function POST(req) {
 
     // Snapshot mode: persist to Blob + return share id/url
 if (wantSnapshot) {
-  const shareId = makeId();
-  await saveSnapshot(shareId, copy);   // <-- write to Blob
+      const shareId = makeId();
+      await saveSnapshot(shareId, copy); // <-- write to Blob
 
-  const base = process.env.SHARE_BASE; // e.g. "https://your-site.com/seo-check"
-  const shareUrl = base ? `${base}?id=${shareId}` : undefined;
+      const base =
+        process.env.SHARE_BASE ||
+        (() => {
+          try {
+            const u = new URL(req.url);
+            return `${u.origin}/`; // fallback to current origin
+          } catch {
+            return "";
+          }
+        })();
 
-  return json(req, 200, { ...copy, shareId, ...(shareUrl && { shareUrl }) });
-}
+      const shareUrl = base ? `${base}?id=${shareId}` : undefined;
+      return json(req, 200, { ok: true, ...copy, shareId, ...(shareUrl && { shareUrl }) });
+    }
 
     // Normal response
     return json(req, 200, { ...copy, _diag });
@@ -1193,6 +1215,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
