@@ -69,6 +69,35 @@ const LOCK_PLACEHOLDER = (id) => ({
   locked: true,
 });
 
+const BLOB_BASE = "https://blob.vercel-storage.com";
+const BLOB_TOKEN = process.env.BLOB_READ_WRITE_TOKEN;
+
+const makeId = () => Math.random().toString(36).slice(2, 8);
+
+async function saveSnapshot(id, payload) {
+  if (!BLOB_TOKEN) return null;
+  const res = await fetch(`${BLOB_BASE}/${id}.json`, {
+    method: "PUT",
+    headers: {
+      "Authorization": `Bearer ${BLOB_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error("Blob save failed");
+  return id;
+}
+
+async function loadSnapshot(id) {
+  if (!BLOB_TOKEN) return null;
+  const r = await fetch(`${BLOB_BASE}/${id}.json`, {
+    headers: { "Authorization": `Bearer ${BLOB_TOKEN}` },
+    cache: "no-store",
+  });
+  if (!r.ok) return null;
+  return await r.json();
+}
+
 /** ---------- CORS (dynamic echo) ---------- */
 function corsHeadersFrom(req) {
   const origin = req?.headers?.get("origin") || "*";
@@ -120,6 +149,15 @@ function cacheSet(key, payload) {
 /** ---------- GET ---------- */
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
+
+  // 1) Snapshot load
+  const snapId = searchParams.get("id");
+  if (snapId) {
+    const snap = await loadSnapshot(snapId);
+    if (snap) return json(req, 200, { ...snap, fromSnapshot: true, shareId: snapId });
+    return json(req, 404, { ok: false, errors: ["Snapshot not found"] });
+  }
+  
   const rawUrl = searchParams.get("url");
   if (!rawUrl) return json(req, 200, { ok: true, ping: "pong" });
 
@@ -149,6 +187,7 @@ export async function POST(req) {
   try {
     const body = await req.json().catch(() => ({}));
     const rawUrl = body?.url;
+    const wantSnapshot = !!body?.snapshot;
     const noCache = !!body?.nocache;
     if (!rawUrl) return json(req, 400, { ok: false, errors: ["Invalid URL"] });
 
@@ -163,6 +202,15 @@ export async function POST(req) {
 
     const out = await runAudit(req, rawUrl);
     const { _diag, ...copy } = out;
+
+    if (wantSnapshot && BLOB_TOKEN) {
+      const id = makeId();
+      await saveSnapshot(id, copy);
+      const origin = new URL(req.url).origin;
+      copy.shareId = id;
+      copy.shareUrl = `${origin}/?id=${id}`;
+    }
+   
     if (!copy.blocked && !copy.timeout) cacheSet(key, copy);
     return json(req, 200, { ...copy, _diag });
   } catch (e) {
@@ -1094,6 +1142,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
