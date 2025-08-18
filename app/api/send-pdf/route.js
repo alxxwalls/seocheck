@@ -3,13 +3,20 @@ export const runtime = "nodejs";
 
 import React from "react";
 import { Resend } from "resend";
-import { Document, Page, Text, View, StyleSheet, pdf } from "@react-pdf/renderer";
+import {
+  Document,
+  Page,
+  Text,
+  View,
+  StyleSheet,
+  renderToBuffer, // <-- use this
+} from "@react-pdf/renderer";
 
 /* ---------- CORS ---------- */
 const ALLOWED =
   (process.env.CORS_ALLOWED_ORIGINS || "")
     .split(",")
-    .map(s => s.trim())
+    .map((s) => s.trim())
     .filter(Boolean);
 
 function allowOrigin(req) {
@@ -52,6 +59,7 @@ function AuditPdf({ url, metaTitle, metaDescription, score, catScores }) {
     <Document>
       <Page size="A4" style={styles.page}>
         <Text style={styles.h1}>SEO Audit Snapshot</Text>
+
         <View style={{ marginBottom: 10 }}>
           <Text style={styles.p}>URL: {url || "-"}</Text>
           <Text style={styles.p}>Meta title: {metaTitle || "-"}</Text>
@@ -60,7 +68,9 @@ function AuditPdf({ url, metaTitle, metaDescription, score, catScores }) {
 
         <Text style={styles.h2}>Score</Text>
         <View>
-          <Text style={styles.row}>Overall: {Number.isFinite(score) ? score : "-"}</Text>
+          <Text style={styles.row}>
+            Overall: {Number.isFinite(score) ? score : "-"}
+          </Text>
           {catScores ? (
             <>
               <Text style={styles.row}>SEO: {pct(catScores.SEO)}</Text>
@@ -98,8 +108,8 @@ export async function POST(request) {
     const score = Number.isFinite(p.overall) ? p.overall : null;
     const catScores = p.catScores || null;
 
-    // Build PDF -> Buffer -> base64 (avoid circular JSON issues)
-    const element = (
+    // ✅ Build a real Buffer with renderToBuffer (no circular refs)
+    const pdfBuffer = await renderToBuffer(
       <AuditPdf
         url={url}
         metaTitle={metaTitle}
@@ -108,10 +118,7 @@ export async function POST(request) {
         catScores={catScores}
       />
     );
-    const buf = await pdf(element).toBuffer();
-    const base64 = Buffer.from(buf).toString("base64");
 
-    // Send email
     const resendKey = process.env.RESEND_API_KEY;
     const from = process.env.FROM_EMAIL;
     if (!resendKey || !from) {
@@ -123,6 +130,7 @@ export async function POST(request) {
 
     const resend = new Resend(resendKey);
 
+    // Option A: send Buffer directly
     await resend.emails.send({
       from,
       to,
@@ -131,15 +139,27 @@ export async function POST(request) {
       attachments: [
         {
           filename: "seo-audit.pdf",
-          content: base64,
-          encoding: "base64",
+          content: pdfBuffer,                // Buffer
+          contentType: "application/pdf",
         },
       ],
     });
 
+    // If your Resend version requires base64 instead of Buffer, swap the block above for:
+    //
+    // const base64 = pdfBuffer.toString("base64");
+    // await resend.emails.send({
+    //   from,
+    //   to,
+    //   subject: "Your SEO Audit PDF",
+    //   text: `Hi,\n\nAttached is your SEO audit snapshot for: ${url || "your site"}.\n\n— Lekker Marketing`,
+    //   attachments: [
+    //     { filename: "seo-audit.pdf", content: base64, encoding: "base64", contentType: "application/pdf" },
+    //   ],
+    // });
+
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
   } catch (err) {
-    // Don’t stringify the whole error object; just message
     return new Response(
       JSON.stringify({ ok: false, errors: [err?.message || "Unknown error"] }),
       { status: 500, headers }
