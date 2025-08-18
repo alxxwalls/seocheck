@@ -146,6 +146,34 @@ function cacheSet(key, payload) {
   CACHE.set(key, { payload, createdAt: now, expiresAt: now + CACHE_TTL_MS });
 }
 
+/** ---------- snapshots (in-memory, ephemeral) ---------- */
+const SNAP_TTL_MS = parseInt(process.env.SNAPSHOT_TTL_MS || "1209600000", 10); // 14 days
+const SNAPSHOTS = new Map(); // id -> { payload, createdAt, expiresAt }
+
+function makeId() {
+  const a = new Uint8Array(12);
+  crypto.getRandomValues(a);
+  return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function snapshotSet(payload) {
+  const id = makeId();
+  const now = Date.now();
+  SNAPSHOTS.set(id, { payload, createdAt: now, expiresAt: now + SNAP_TTL_MS });
+  return id;
+}
+
+function snapshotGet(id) {
+  const rec = SNAPSHOTS.get(id);
+  if (!rec) return null;
+  if (Date.now() > rec.expiresAt) {
+    SNAPSHOTS.delete(id);
+    return null;
+  }
+  return rec;
+}
+
+
 /** ---------- GET ---------- */
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
@@ -187,12 +215,14 @@ export async function POST(req) {
   try {
     const body = await req.json().catch(() => ({}));
     const rawUrl = body?.url;
-    const wantSnapshot = !!body?.snapshot;
     const noCache = !!body?.nocache;
+    const wantSnapshot = !!body?.snapshot;
+
     if (!rawUrl) return json(req, 400, { ok: false, errors: ["Invalid URL"] });
 
+    // Use cache only for normal runs (not when explicitly snapshotting)
     const key = normalizeKey(rawUrl);
-    if (!noCache) {
+    if (!noCache && !wantSnapshot) {
       const hit = cacheGet(key);
       if (hit) {
         const age = Date.now() - hit.createdAt;
@@ -203,21 +233,25 @@ export async function POST(req) {
     const out = await runAudit(req, rawUrl);
     const { _diag, ...copy } = out;
 
-    if (wantSnapshot && BLOB_TOKEN) {
-      const id = makeId();
-      await saveSnapshot(id, copy);
-      const origin = new URL(req.url).origin;
-      copy.shareId = id;
-      copy.shareUrl = `${origin}/?id=${id}`;
+    // Cache normal successful runs
+    if (!copy.blocked && !copy.timeout && !wantSnapshot) cacheSet(key, copy);
+
+    // Snapshot mode: save + return share id/url
+    if (wantSnapshot) {
+      const shareId = snapshotSet(copy);
+      const base = process.env.SHARE_BASE; // e.g., "https://lekker.marketing/seo-audit"
+      const shareUrl = base ? `${base}?id=${shareId}` : undefined;
+      return json(req, 200, { ...copy, shareId, ...(shareUrl && { shareUrl }) });
     }
-   
-    if (!copy.blocked && !copy.timeout) cacheSet(key, copy);
+
+    // Normal response
     return json(req, 200, { ...copy, _diag });
   } catch (e) {
     const msg = e?.message || "Unknown error";
     return json(req, 500, { ok: false, errors: [msg] });
   }
 }
+
 
 /** ---------- utils ---------- */
 const isOk = (res) => res && res.status >= 200 && res.status < 400;
@@ -1142,6 +1176,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
