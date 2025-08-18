@@ -3,33 +3,25 @@ export const runtime = "nodejs";
 
 import React from "react";
 import { Resend } from "resend";
-import {
-  Document,
-  Page,
-  Text,
-  View,
-  StyleSheet,
-  pdf,
-} from "@react-pdf/renderer";
+import { Document, Page, Text, View, StyleSheet, pdf } from "@react-pdf/renderer";
 
-/* ---------- CORS helpers ---------- */
+/* ---------- CORS ---------- */
 const ALLOWED =
   (process.env.CORS_ALLOWED_ORIGINS || "")
     .split(",")
-    .map((s) => s.trim())
+    .map(s => s.trim())
     .filter(Boolean);
 
-function resolveAllowOrigin(req) {
+function allowOrigin(req) {
   const origin = req.headers.get("origin");
   if (!origin) return "*";
-  if (ALLOWED.length === 0) return "*"; // default permissive (no credentials used)
-  if (ALLOWED.includes("*")) return "*";
-  return ALLOWED.includes(origin) ? origin : ALLOWED[0]; // fallback to first allowed
+  if (ALLOWED.length === 0 || ALLOWED.includes("*")) return "*";
+  return ALLOWED.includes(origin) ? origin : ALLOWED[0];
 }
 
 function corsHeaders(req) {
   return {
-    "Access-Control-Allow-Origin": resolveAllowOrigin(req),
+    "Access-Control-Allow-Origin": allowOrigin(req),
     "Access-Control-Allow-Methods": "POST,OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age": "86400",
@@ -37,7 +29,11 @@ function corsHeaders(req) {
   };
 }
 
-/* ---------- PDF doc ---------- */
+export async function OPTIONS(request) {
+  return new Response(null, { status: 204, headers: corsHeaders(request) });
+}
+
+/* ---------- PDF ---------- */
 const styles = StyleSheet.create({
   page: { padding: 36, fontSize: 12 },
   h1: { fontSize: 18, fontWeight: 700, marginBottom: 8 },
@@ -45,6 +41,11 @@ const styles = StyleSheet.create({
   p: { marginBottom: 4, lineHeight: 1.4 },
   row: { marginBottom: 2 },
 });
+
+function pct(v) {
+  if (typeof v !== "number") return "-";
+  return `${Math.round(v * 100)}%`;
+}
 
 function AuditPdf({ url, metaTitle, metaDescription, score, catScores }) {
   return (
@@ -62,9 +63,9 @@ function AuditPdf({ url, metaTitle, metaDescription, score, catScores }) {
           <Text style={styles.row}>Overall: {Number.isFinite(score) ? score : "-"}</Text>
           {catScores ? (
             <>
-              <Text style={styles.row}>SEO: {formatPct(catScores.SEO)}</Text>
-              <Text style={styles.row}>Performance: {formatPct(catScores.PERFORMANCE)}</Text>
-              <Text style={styles.row}>Security: {formatPct(catScores.SECURITY)}</Text>
+              <Text style={styles.row}>SEO: {pct(catScores.SEO)}</Text>
+              <Text style={styles.row}>Performance: {pct(catScores.PERFORMANCE)}</Text>
+              <Text style={styles.row}>Security: {pct(catScores.SECURITY)}</Text>
             </>
           ) : null}
         </View>
@@ -75,48 +76,30 @@ function AuditPdf({ url, metaTitle, metaDescription, score, catScores }) {
   );
 }
 
-function formatPct(v) {
-  if (typeof v !== "number") return "-";
-  return `${Math.round(v * 100)}%`;
-}
-
-/* ---------- OPTIONS (preflight) ---------- */
-export async function OPTIONS(request) {
-  return new Response(null, {
-    status: 204,
-    headers: corsHeaders(request),
-  });
-}
-
-/* ---------- POST (send email with PDF) ---------- */
+/* ---------- POST ---------- */
 export async function POST(request) {
-  const headers = {
-    "Content-Type": "application/json",
-    ...corsHeaders(request),
-  };
+  const headers = { "Content-Type": "application/json", ...corsHeaders(request) };
 
   try {
     const body = await request.json().catch(() => ({}));
-    // Accept either flattened fields or nested under `payload`
     const p = body?.payload && typeof body.payload === "object" ? body.payload : body;
 
-    const email = body?.email || p?.email;
-    if (!email) {
+    const to = body?.email || p?.email;
+    if (!to) {
       return new Response(JSON.stringify({ ok: false, errors: ["Missing email"] }), {
         status: 400,
         headers,
       });
     }
 
-    // Extract fields you send from the widget
     const url = p.url || p.finalUrl || p.normalizedUrl || "";
     const metaTitle = p.metaTitle || p.title || "";
     const metaDescription = p.metaDescription || "";
     const score = Number.isFinite(p.overall) ? p.overall : null;
     const catScores = p.catScores || null;
 
-    // Build PDF
-    const doc = (
+    // Build PDF -> Buffer -> base64 (avoid circular JSON issues)
+    const element = (
       <AuditPdf
         url={url}
         metaTitle={metaTitle}
@@ -125,9 +108,10 @@ export async function POST(request) {
         catScores={catScores}
       />
     );
-    const pdfBuffer = await pdf(doc).toBuffer();
+    const buf = await pdf(element).toBuffer();
+    const base64 = Buffer.from(buf).toString("base64");
 
-    // Email via Resend
+    // Send email
     const resendKey = process.env.RESEND_API_KEY;
     const from = process.env.FROM_EMAIL;
     if (!resendKey || !from) {
@@ -141,19 +125,21 @@ export async function POST(request) {
 
     await resend.emails.send({
       from,
-      to: email,
+      to,
       subject: "Your SEO Audit PDF",
       text: `Hi,\n\nAttached is your SEO audit snapshot for: ${url || "your site"}.\n\n— Lekker Marketing`,
       attachments: [
         {
           filename: "seo-audit.pdf",
-          content: pdfBuffer,
+          content: base64,
+          encoding: "base64",
         },
       ],
     });
 
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
   } catch (err) {
+    // Don’t stringify the whole error object; just message
     return new Response(
       JSON.stringify({ ok: false, errors: [err?.message || "Unknown error"] }),
       { status: 500, headers }
