@@ -40,6 +40,28 @@ export async function OPTIONS(request) {
   return new Response(null, { status: 204, headers: corsHeaders(request) });
 }
 
+/* -------------------- HTML entity decoder (server) -------------------- */
+// Decodes numeric (&#123; &#x1F4A9;) and a few common named entities (&amp; &lt; &gt; &quot; &apos; &nbsp;)
+function decodeHtmlServer(str = "") {
+  let s = String(str);
+
+  // numeric decimal: &#123;
+  s = s.replace(/&#(\d+);/g, (_, n) => {
+    try { return String.fromCodePoint(parseInt(n, 10)); } catch { return _; }
+  });
+
+  // numeric hex: &#x1F4A9;
+  s = s.replace(/&#x([\da-fA-F]+);/g, (_, n) => {
+    try { return String.fromCodePoint(parseInt(n, 16)); } catch { return _; }
+  });
+
+  // common named entities
+  const map = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+  s = s.replace(/&([a-zA-Z]+);/g, (m, name) => (map[name] ?? m));
+
+  return s;
+}
+
 /* ------------------- Audit constants ------------------- */
 const CATS = {
   SEO: [
@@ -314,7 +336,7 @@ function AuditPdf({
   metaDescription,
   overall,
   catScores,
-  cats,           // grouped checks by category with labels
+  cats,
   topFails = [],
   warns = [],
   shareUrl,
@@ -387,18 +409,20 @@ export async function POST(request) {
       });
     }
 
-    // Extract payload fields
+    // Extract & decode payload fields
     const url = p.url || p.finalUrl || p.normalizedUrl || "";
-    const metaTitle = p.metaTitle || p.title || "";
-    const metaDescription = p.metaDescription || "";
+    const metaTitle = decodeHtmlServer(p.metaTitle || p.title || "");
+    const metaDescription = decodeHtmlServer(p.metaDescription || "");
     const shareUrl = p.shareUrl || "";
 
-    const checks = Array.isArray(p.checks) ? p.checks.map((c) => ({
-      id: String(c.id || ""),
-      status: String(c.status || "").toLowerCase(),
-      details: c.details ? String(c.details) : "",
-      value: typeof c.value !== "undefined" ? c.value : undefined,
-    })) : [];
+    const checks = Array.isArray(p.checks)
+      ? p.checks.map((c) => ({
+          id: String(c.id || ""),
+          status: String(c.status || "").toLowerCase(),
+          details: decodeHtmlServer(c.details ? String(c.details) : ""),
+          value: typeof c.value !== "undefined" ? c.value : undefined,
+        }))
+      : [];
 
     // Ensure we have a score (compute if missing)
     const providedOverall = Number.isFinite(p.overall) ? p.overall : null;
@@ -431,7 +455,7 @@ export async function POST(request) {
 
     // Send email
     const resendKey = process.env.RESEND_API_KEY;
-    const from = process.env.FROM_EMAIL;
+    const from = <'Lekker Marketing'> process.env.FROM_EMAIL;
     if (!resendKey || !from) {
       return new Response(
         JSON.stringify({ ok: false, errors: ["Server misconfigured: missing RESEND_API_KEY or FROM_EMAIL"] }),
