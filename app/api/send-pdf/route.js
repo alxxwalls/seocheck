@@ -455,7 +455,7 @@ export async function POST(request) {
 
     // Send email
     const resendKey = process.env.RESEND_API_KEY;
-    const from = <'Lekker Marketing'> process.env.FROM_EMAIL;
+    const from = process.env.FROM_EMAIL;
     if (!resendKey || !from) {
       return new Response(
         JSON.stringify({ ok: false, errors: ["Server misconfigured: missing RESEND_API_KEY or FROM_EMAIL"] }),
