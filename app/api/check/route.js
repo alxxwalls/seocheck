@@ -37,7 +37,7 @@ const OVERALL_BUDGET_MS = parseInt(process.env.AUDIT_BUDGET_MS || "8500", 10);
 const LIMITS = {
   SITEMAP_SAMPLES: 1, // was 2
   IMAGE_HEADS: 2,     // was 4
-  TIME_PAGE_MS: 6000, // was 12000
+  TIME_PAGE_MS: 10000, // was 12000
   TIME_ASSET_MS: 2000,// was 5000
   TIME_SMALL_MS: 2500,// was 4000
   TIME_PSI_MS: 3000,  // was 10000
@@ -1255,3 +1255,4 @@ async function runAudit(req, rawUrl) {
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
