@@ -35,13 +35,13 @@ const BLOCK_CODES = new Set([401, 403, 429]);
 const OVERALL_BUDGET_MS = parseInt(process.env.AUDIT_BUDGET_MS || "8500", 10);
 
 const LIMITS = {
-  SITEMAP_SAMPLES: 1,     // was 2
-  IMAGE_HEADS: 2,         // was 4
-  TIME_PAGE_MS: 6000,     // was 12000
-  TIME_ASSET_MS: 2000,    // was 5000
-  TIME_SMALL_MS: 2500,    // was 4000
-  TIME_PSI_MS: 3000,      // was 10000
-  MAX_SUBREQUESTS: 8,     // was 12
+  SITEMAP_SAMPLES: 1, // was 2
+  IMAGE_HEADS: 2,     // was 4
+  TIME_PAGE_MS: 6000, // was 12000
+  TIME_ASSET_MS: 2000,// was 5000
+  TIME_SMALL_MS: 2500,// was 4000
+  TIME_PSI_MS: 3000,  // was 10000
+  MAX_SUBREQUESTS: 8, // was 12
 };
 
 /** ---------- omit compute, but return locked placeholders ---------- */
@@ -85,7 +85,7 @@ const BLOB_PUBLIC_BASE =
   process.env.BLOB_PUBLIC_BASE ||
   "https://fqnbg6i9weauas3p.public.blob.vercel-storage.com"; // <-- your public host
 const BLOB_TOKEN =
-   process.env.BLOB_READ_WRITE_TOKEN_READ_WRITE_TOKEN || "";
+  process.env.BLOB_READ_WRITE_TOKEN_READ_WRITE_TOKEN || "";
 
 // One ID generator (keep only one in file)
 function makeId() {
@@ -115,7 +115,6 @@ async function saveSnapshot(payload) {
   return { shareBlobPath: blob.pathname, shareBlobUrl: blob.url };
 }
 
-
 // Load by full URL OR by path (with/without leading slash)
 async function loadSnapshotByPath(pathOrUrl) {
   const isAbs = typeof pathOrUrl === "string" && pathOrUrl.includes("://");
@@ -136,7 +135,6 @@ async function loadSnapshotByPath(pathOrUrl) {
     ? { ok: true, json }
     : { ok: false, error: "Blob JSON parse failed", attempted: url };
 }
-
 
 /** ---------- CORS (dynamic echo) ---------- */
 function corsHeadersFrom(req) {
@@ -193,8 +191,7 @@ function makeId() {
   return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
 } */
 
-
-/** ---------- snapshots (in-memory, ephemeral) ---------- 
+/** ---------- snapshots (in-memory, ephemeral) ----------
 const SNAP_TTL_MS = parseInt(process.env.SNAPSHOT_TTL_MS || "1209600000", 10); // 14 days
 const SNAPSHOTS = new Map(); // id -> { payload, createdAt, expiresAt }
 
@@ -221,7 +218,6 @@ function snapshotGet(id) {
   return rec;
 }*/
 
-
 /** ---------- GET ---------- */
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
@@ -246,7 +242,6 @@ export async function GET(req) {
     return json(req, 404, { ok: false, errors: ["Snapshot not found (id)"], attempted: [try1.attempted, try2.attempted].filter(Boolean) });
   }
 
-  
   const rawUrl = searchParams.get("url");
   if (!rawUrl) return json(req, 200, { ok: true, ping: "pong" });
 
@@ -336,7 +331,6 @@ export async function POST(req) {
   }
 }
 
-
 /** ---------- utils ---------- */
 const isOk = (res) => res && res.status >= 200 && res.status < 400;
 
@@ -424,7 +418,6 @@ const tryHeadThenGet = async (
   });
 };
 
-
 const absUrl = (base, href) => { try { return new URL(href, base).toString(); } catch { return undefined; } };
 const parseTitle = (html) => { const m = /<title>([\s\S]*?)<\/title>/i.exec(html); return m ? m[1].trim() : ""; };
 const getMetaBy = (html, attr, name) => {
@@ -458,6 +451,10 @@ async function runAudit(req, rawUrl) {
   let budget = LIMITS.MAX_SUBREQUESTS;
   const spend = (n = 1) => { if (budget - n < 0) return false; budget -= n; return true; };
 
+  // values shared by all code paths so early-returns can use them safely
+  let pageTitle = "";
+  let pageMetaDesc = "";
+
   // Helper: partial fallback for TIMEOUT (no HTML)
   const timeoutPartial = async (statusText = "Main page fetch exceeded time budget") => {
     const checks = [];
@@ -470,11 +467,7 @@ async function runAudit(req, rawUrl) {
       details: statusText,
     });
 
-    // hoisted so early-return paths can reference safely
-let title = "";
-let metaDesc = "";
-
-   // favicon
+    // favicon
     try {
       const favUrl = new URL("/favicon.ico", normalizedUrl).toString();
       const r = await tryHeadThenGet(favUrl, { timeoutMs: within(LIMITS.TIME_ASSET_MS), headers: BROWSER_HEADERS });
@@ -483,97 +476,96 @@ let metaDesc = "";
       checks.push({ id: "favicon", label: "Favicon present & loads", status: "warn", details: "Unknown" });
     }
 
-   // robots.txt (best-effort + capture Sitemap: URLs + quick allow check)
-let robotsSitemaps = [];           // <-- make sure this is in scope for the sitemap probe below
-try {
-  // Always resolve from the site origin, not the deep page
-  const origin = (() => { try { return new URL(normalizedUrl).origin; } catch { return normalizedUrl; } })();
-  const robotsURL = new URL("/robots.txt", origin).toString();
-
-  await timed("robots-timeout", async () => {
-    const toR = withTimeout(within(LIMITS.TIME_SMALL_MS));
+    // robots.txt (best-effort + capture Sitemap: URLs + quick allow check)
+    let robotsSitemaps = [];
     try {
-      const r = await fetch(robotsURL, {
-        signal: toR.signal,
-        headers: BROWSER_HEADERS,
-        cache: "no-store",
+      // Always resolve from the site origin, not the deep page
+      const origin = (() => { try { return new URL(normalizedUrl).origin; } catch { return normalizedUrl; } })();
+      const robotsURL = new URL("/robots.txt", origin).toString();
+
+      await timed("robots-timeout", async () => {
+        const toR = withTimeout(within(LIMITS.TIME_SMALL_MS));
+        try {
+          const r = await fetch(robotsURL, {
+            signal: toR.signal,
+            headers: BROWSER_HEADERS,
+            cache: "no-store",
+          });
+
+          if (r.ok) {
+            const txt = await r.text();
+
+            // Collect all explicit Sitemap: URLs (absolute them against robots location)
+            const matches = [...txt.matchAll(/^\s*Sitemap:\s*(\S+)\s*$/gim)];
+            robotsSitemaps = matches
+              .map((m) => absUrl(robotsURL, m[1]))
+              .filter(Boolean);
+
+            // Quick “is everything disallowed for * ?”
+            const blocks = txt.split(/(?=^User-agent:\s*)/gim);
+            const star = blocks.find((b) => /^User-agent:\s*\*/im.test(b)) || "";
+            const disallowAll = /^\s*Disallow:\s*\/\s*$/im.test(star);
+
+            checks.push({
+              id: "robots",
+              label: "robots.txt allows indexing",
+              status: disallowAll ? "fail" : "warn",
+              details:
+                (disallowAll ? "User-agent: * disallows /" : "Accessible") +
+                (robotsSitemaps.length ? ` • ${robotsSitemaps.length} sitemap URL(s) listed` : ""),
+            });
+          } else {
+            checks.push({
+              id: "robots",
+              label: "robots.txt allows indexing",
+              status: "warn",
+              details: `Unavailable (HTTP ${r.status})`,
+            });
+          }
+        } finally {
+          toR.done();
+        }
       });
-
-      if (r.ok) {
-        const txt = await r.text();
-
-        // Collect all explicit Sitemap: URLs (absolute them against robots location)
-        const matches = [...txt.matchAll(/^\s*Sitemap:\s*(\S+)\s*$/gim)];
-        robotsSitemaps = matches
-          .map((m) => absUrl(robotsURL, m[1]))
-          .filter(Boolean);
-
-        // Quick “is everything disallowed for * ?”
-        const blocks = txt.split(/(?=^User-agent:\s*)/gim);
-        const star = blocks.find((b) => /^User-agent:\s*\*/im.test(b)) || "";
-        const disallowAll = /^\s*Disallow:\s*\/\s*$/im.test(star);
-
-        checks.push({
-          id: "robots",
-          label: "robots.txt allows indexing",
-          status: disallowAll ? "fail" : "warn",
-          details:
-            (disallowAll ? "User-agent: * disallows /" : "Accessible") +
-            (robotsSitemaps.length ? ` • ${robotsSitemaps.length} sitemap URL(s) listed` : ""),
-        });
-      } else {
-        checks.push({
-          id: "robots",
-          label: "robots.txt allows indexing",
-          status: "warn",
-          details: `Unavailable (HTTP ${r.status})`,
-        });
-      }
-    } finally {
-      toR.done();
+    } catch {
+      checks.push({
+        id: "robots",
+        label: "robots.txt allows indexing",
+        status: "warn",
+        details: "Unavailable",
+      });
     }
-  });
-} catch {
-  checks.push({
-    id: "robots",
-    label: "robots.txt allows indexing",
-    status: "warn",
-    details: "Unavailable",
-  });
-}
 
-// Sitemap (HEAD only; common paths + robots.txt advertised URLs)
-const origin = (() => { try { return new URL(normalizedUrl).origin; } catch { return normalizedUrl; } })();
+    // Sitemap (HEAD only; common paths + robots.txt advertised URLs)
+    const origin = (() => { try { return new URL(normalizedUrl).origin; } catch { return normalizedUrl; } })();
 
-let sitemapFound = null;
-const candidates = new Set([
-  new URL("/sitemap.xml", origin).toString(),
-  new URL("/sitemap_index.xml", origin).toString(),
-  new URL("/sitemap-index.xml", origin).toString(),
-  new URL("/wp-sitemap.xml", origin).toString(),   // WordPress core
-  ...(robotsSitemaps || []),
-]);
+    let sitemapFound = null;
+    const candidates = new Set([
+      new URL("/sitemap.xml", origin).toString(),
+      new URL("/sitemap_index.xml", origin).toString(),
+      new URL("/sitemap-index.xml", origin).toString(),
+      new URL("/wp-sitemap.xml", origin).toString(),   // WordPress core
+      ...(robotsSitemaps || []),
+    ]);
 
-for (const u of candidates) {
-  if (timeLeft && timeLeft() < 300) break;
-  try {
-    const h = await tryHeadThenGet(u, {
-      timeoutMs: within ? within(LIMITS.TIME_SMALL_MS) : LIMITS.TIME_SMALL_MS,
-      headers: BROWSER_HEADERS,
+    for (const u of candidates) {
+      if (timeLeft && timeLeft() < 300) break;
+      try {
+        const h = await tryHeadThenGet(u, {
+          timeoutMs: within ? within(LIMITS.TIME_SMALL_MS) : LIMITS.TIME_SMALL_MS,
+          headers: BROWSER_HEADERS,
+        });
+        if (isOk(h)) { sitemapFound = h.url || u; break; }
+      } catch {}
+    }
+
+    checks.push({
+      id: "sitemap",
+      label: "Sitemap exists & URLs valid",
+      status: sitemapFound ? "warn" : "fail",
+      details: sitemapFound
+        ? `Found: ${sitemapFound} (content not parsed in this fast path)`
+        : "No sitemap found at common paths or in robots.txt",
     });
-    if (isOk(h)) { sitemapFound = h.url || u; break; }
-  } catch {}
-}
-
-checks.push({
-  id: "sitemap",
-  label: "Sitemap exists & URLs valid",
-  status: sitemapFound ? "warn" : "fail",
-  details: sitemapFound
-    ? `Found: ${sitemapFound} (content not parsed in this fast path)`
-    : "No sitemap found at common paths or in robots.txt",
-});
-   
 
     // placeholders
     for (const id of OMIT_CHECKS) checks.push(LOCK_PLACEHOLDER(id));
@@ -613,9 +605,9 @@ checks.push({
       finalUrl: normalizedUrl,
       fetchedStatus: 0,
       timingMs: OVERALL_BUDGET_MS,
-      title,
-      metaTitle: title, 
-      metaDescription: metaDesc, 
+      title: pageTitle,
+      metaTitle: pageTitle || "",
+      metaDescription: pageMetaDesc || "",
       speed: psi,
       checks,
     };
@@ -648,161 +640,159 @@ checks.push({
     throw e; // non-timeout errors behave as before
   }
 
- // ---- Blocked handling (401/403/429) ----
-if (BLOCK_CODES.has(pageRes.status)) {
-  await timed("blocked-retry", async () => {
-    try {
-      const to2 = withTimeout(within(6000));
-      try {
-        const r = await fetch(normalizedUrl, {
-          redirect: "follow",
-          signal: to2.signal,
-          headers: BROWSER_HEADERS,
-          cache: "no-store",
-        });
-        pageRes = r;
-      } finally { to2.done(); }
-    } catch {}
-  });
-
+  // ---- Blocked handling (401/403/429) ----
   if (BLOCK_CODES.has(pageRes.status)) {
-    // --- Build a dedicated "blocked" payload so the UI can show the red banner ---
-const status = pageRes.status;
-const finalUrlBlocked = pageRes.url || normalizedUrl;
-
-// derive origin from the blocked URL
-let originBlocked;
-try { originBlocked = new URL(finalUrlBlocked).origin; } catch { originBlocked = normalizedUrl; }
-
-const checks = [];
-
-// 1) The prominent blocked card
-checks.push({
-  id: "blocked",
-  label: "Blocked by bot protection",
-  status: "fail",
-  details: `Received ${status} from ${finalUrlBlocked}`,
-});
-
-// 2) Best-effort robots.txt (to show it’s not *our* error)
-let robotsSitemaps = [];
-try {
-  const robotsURL = new URL("/robots.txt", originBlocked).toString();
-  await timed("robots-blocked", async () => {
-    const tor = withTimeout(within(LIMITS.TIME_SMALL_MS));
-    try {
-      const r = await fetch(robotsURL, {
-        redirect: "follow",
-        signal: tor.signal,
-        headers: BROWSER_HEADERS,
-        cache: "no-store",
-      });
-      if (r.ok) {
-        const txt = await r.text();
-        const matches = [...txt.matchAll(/^\s*Sitemap:\s*(\S+)\s*$/gim)];
-        robotsSitemaps = matches.map((m) => absUrl(robotsURL, m[1])).filter(Boolean);
-
-        const blocks = txt.split(/(?=^User-agent:\s*)/gim);
-        const star = blocks.find((b) => /^User-agent:\s*\*/im.test(b)) || "";
-        const disallowAll = /^\s*Disallow:\s*\/\s*$/im.test(star);
-
-        checks.push({
-          id: "robots",
-          label: "robots.txt allows indexing",
-          status: disallowAll ? "fail" : "warn",
-          details:
-            (disallowAll ? "User-agent: * disallows /" : "Accessible") +
-            (robotsSitemaps.length ? ` • ${robotsSitemaps.length} sitemap URL(s) listed` : ""),
-        });
-      } else {
-        checks.push({
-          id: "robots",
-          label: "robots.txt allows indexing",
-          status: "warn",
-          details: `Unavailable (HTTP ${r.status})`,
-        });
-      }
-    } finally { tor.done(); }
-  });
-} catch {
-  checks.push({ id: "robots", label: "robots.txt allows indexing", status: "warn", details: "Unavailable" });
-}
-
-// 3) Quick sitemap HEAD probe (common + robots + wp-sitemap)
-let sitemapFound = null;
-const candidates = new Set([
-  new URL("/sitemap.xml", originBlocked).toString(),
-  new URL("/sitemap_index.xml", originBlocked).toString(),
-  new URL("/sitemap-index.xml", originBlocked).toString(),
-  new URL("/wp-sitemap.xml", originBlocked).toString(),
-  ...robotsSitemaps,
-]);
-
-for (const u of candidates) {
-  if (timeLeft() < 300) break;
-  try {
-    const h = await tryHeadThenGet(u, {
-      timeoutMs: within(LIMITS.TIME_SMALL_MS),
-      headers: BROWSER_HEADERS,
+    await timed("blocked-retry", async () => {
+      try {
+        const to2 = withTimeout(within(6000));
+        try {
+          const r = await fetch(normalizedUrl, {
+            redirect: "follow",
+            signal: to2.signal,
+            headers: BROWSER_HEADERS,
+            cache: "no-store",
+          });
+          pageRes = r;
+        } finally { to2.done(); }
+      } catch {}
     });
-    if (isOk(h)) { sitemapFound = h.url || u; break; } // <- final URL
-  } catch {}
-}
 
-checks.push({
-  id: "sitemap",
-  label: "Sitemap exists & URLs valid",
-  status: sitemapFound ? "warn" : "fail",
-  details: sitemapFound
-    ? `Found: ${sitemapFound} (content not parsed in blocked path)`
-    : "No sitemap found at common paths or in robots.txt",
-});
+    if (BLOCK_CODES.has(pageRes.status)) {
+      // --- Build a dedicated "blocked" payload so the UI can show the red banner ---
+      const status = pageRes.status;
+      const finalUrlBlocked = pageRes.url || normalizedUrl;
 
-// 4) Favicon quick probe (nice to have)
-try {
-  const fav = new URL("/favicon.ico", originBlocked).toString();
-  const h = await tryHeadThenGet(fav, { timeoutMs: within(LIMITS.TIME_ASSET_MS), headers: BROWSER_HEADERS });
-  checks.push({
-    id: "favicon",
-    label: "Favicon present & loads",
-    status: isOk(h) ? "pass" : "warn",
-    details: fav,
-  });
-} catch {
-  checks.push({ id: "favicon", label: "Favicon present & loads", status: "warn", details: "Unknown" });
-}
+      // derive origin from the blocked URL
+      let originBlocked;
+      try { originBlocked = new URL(finalUrlBlocked).origin; } catch { originBlocked = normalizedUrl; }
 
-// 5) Add your locked placeholders so UI shows teasers
-for (const id of OMIT_CHECKS) checks.push(LOCK_PLACEHOLDER(id));
-for (const id of ["h1-structure", "llms"]) checks.push(LOCK_PLACEHOLDER(id));
+      const checks = [];
 
-// Return early with a clear "blocked" payload
-const payload = {
-  ok: true,
-  blocked: true,
-  url: rawUrl,
-  normalizedUrl,
-  finalUrl: finalUrlBlocked,
-  fetchedStatus: status,
-  timingMs: Date.now() - t0,
-  title: "",
-  metaTitle: title, 
-  metaDescription: "",
-  checks,
-};
-if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
-return payload;
+      // 1) The prominent blocked card
+      checks.push({
+        id: "blocked",
+        label: "Blocked by bot protection",
+        status: "fail",
+        details: `Received ${status} from ${finalUrlBlocked}`,
+      });
 
+      // 2) Best-effort robots.txt (to show it’s not *our* error)
+      let robotsSitemaps = [];
+      try {
+        const robotsURL = new URL("/robots.txt", originBlocked).toString();
+        await timed("robots-blocked", async () => {
+          const tor = withTimeout(within(LIMITS.TIME_SMALL_MS));
+          try {
+            const r = await fetch(robotsURL, {
+              redirect: "follow",
+              signal: tor.signal,
+              headers: BROWSER_HEADERS,
+              cache: "no-store",
+            });
+            if (r.ok) {
+              const txt = await r.text();
+              const matches = [...txt.matchAll(/^\s*Sitemap:\s*(\S+)\s*$/gim)];
+              robotsSitemaps = matches.map((m) => absUrl(robotsURL, m[1])).filter(Boolean);
+
+              const blocks = txt.split(/(?=^User-agent:\s*)/gim);
+              const star = blocks.find((b) => /^User-agent:\s*\*/im.test(b)) || "";
+              const disallowAll = /^\s*Disallow:\s*\/\s*$/im.test(star);
+
+              checks.push({
+                id: "robots",
+                label: "robots.txt allows indexing",
+                status: disallowAll ? "fail" : "warn",
+                details:
+                  (disallowAll ? "User-agent: * disallows /" : "Accessible") +
+                  (robotsSitemaps.length ? ` • ${robotsSitemaps.length} sitemap URL(s) listed` : ""),
+              });
+            } else {
+              checks.push({
+                id: "robots",
+                label: "robots.txt allows indexing",
+                status: "warn",
+                details: `Unavailable (HTTP ${r.status})`,
+              });
+            }
+          } finally { tor.done(); }
+        });
+      } catch {
+        checks.push({ id: "robots", label: "robots.txt allows indexing", status: "warn", details: "Unavailable" });
+      }
+
+      // 3) Quick sitemap HEAD probe (common + robots + wp-sitemap)
+      let sitemapFound = null;
+      const candidates = new Set([
+        new URL("/sitemap.xml", originBlocked).toString(),
+        new URL("/sitemap_index.xml", originBlocked).toString(),
+        new URL("/sitemap-index.xml", originBlocked).toString(),
+        new URL("/wp-sitemap.xml", originBlocked).toString(),
+        ...robotsSitemaps,
+      ]);
+
+      for (const u of candidates) {
+        if (timeLeft() < 300) break;
+        try {
+          const h = await tryHeadThenGet(u, {
+            timeoutMs: within(LIMITS.TIME_SMALL_MS),
+            headers: BROWSER_HEADERS,
+          });
+          if (isOk(h)) { sitemapFound = h.url || u; break; } // <- final URL
+        } catch {}
+      }
+
+      checks.push({
+        id: "sitemap",
+        label: "Sitemap exists & URLs valid",
+        status: sitemapFound ? "warn" : "fail",
+        details: sitemapFound
+          ? `Found: ${sitemapFound} (content not parsed in blocked path)`
+          : "No sitemap found at common paths or in robots.txt",
+      });
+
+      // 4) Favicon quick probe (nice to have)
+      try {
+        const fav = new URL("/favicon.ico", originBlocked).toString();
+        const h = await tryHeadThenGet(fav, { timeoutMs: within(LIMITS.TIME_ASSET_MS), headers: BROWSER_HEADERS });
+        checks.push({
+          id: "favicon",
+          label: "Favicon present & loads",
+          status: isOk(h) ? "pass" : "warn",
+          details: fav,
+        });
+      } catch {
+        checks.push({ id: "favicon", label: "Favicon present & loads", status: "warn", details: "Unknown" });
+      }
+
+      // 5) Add your locked placeholders so UI shows teasers
+      for (const id of OMIT_CHECKS) checks.push(LOCK_PLACEHOLDER(id));
+      for (const id of ["h1-structure", "llms"]) checks.push(LOCK_PLACEHOLDER(id));
+
+      // Return early with a clear "blocked" payload
+      const payload = {
+        ok: true,
+        blocked: true,
+        url: rawUrl,
+        normalizedUrl,
+        finalUrl: finalUrlBlocked,
+        fetchedStatus: status,
+        timingMs: Date.now() - t0,
+        title: pageTitle,
+        metaTitle: pageTitle || "",
+        metaDescription: pageMetaDesc || "",
+        checks,
+      };
+      if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
+      return payload;
+    }
   }
-}
-
 
   // ---- Normal path ----
   const html = await pageRes.text();
   const timingMs = Date.now() - t0;
   const finalUrl = pageRes.url;
 
-  title = parseTitle(html);
+  pageTitle = parseTitle(html);
   const urlObj = new URL(finalUrl);
   const origin = `${urlObj.protocol}//${urlObj.host}`;
   const host = urlObj.host;
@@ -863,191 +853,187 @@ return payload;
   });
 
   /** -------- robots.txt -------- */
-let robotsExists = false;
-let robotsAllowsIndex = true;
-let robotsSitemapListed = false;
-let robotsText = "";
-let robotsSitemaps = [];
+  let robotsExists = false;
+  let robotsAllowsIndex = true;
+  let robotsSitemapListed = false;
+  let robotsText = "";
+  let robotsSitemaps = [];
 
-if (timeLeft() > 250) {
-  try {
-    const robotsURL = absUrl(origin + "/", "/robots.txt");
-    await timed("robots", async () => {
-      const r = await retry(async () => {
-        const tor = withTimeout(within(LIMITS.TIME_SMALL_MS));
-        try {
-          return await fetch(robotsURL, {
-            redirect: "follow",
-            signal: tor.signal,
-            headers: BROWSER_HEADERS,
-            cache: "no-store",
-          });
-        } finally {
-          tor.done();
-        }
-      });
-      if (r.ok) {
-        robotsExists = true;
-        robotsText = await r.text();
-
-        // index allow/deny (simple check for User-agent: * + Disallow: /)
-        const blocks = robotsText.split(/(?=^User-agent:\s*)/gim);
-        const star = blocks.find((b) => /^User-agent:\s*\*/im.test(b)) || "";
-        if (/^\s*Disallow:\s*\/\s*$/im.test(star)) robotsAllowsIndex = false;
-
-        // extract explicit Sitemap: lines
-        const sitemapMatches = [...robotsText.matchAll(/^\s*Sitemap:\s*(\S+)\s*$/gim)];
-        robotsSitemaps = sitemapMatches
-          .map((m) => absUrl(robotsURL, m[1]))
-          .filter(Boolean);
-        robotsSitemapListed = robotsSitemaps.length > 0;
-      }
-    });
-  } catch {}
-}
-
-checks.push({
-  id: "robots",
-  label: "robots.txt allows indexing",
-  status: robotsExists ? (robotsAllowsIndex ? "pass" : "fail") : "warn",
-  details: robotsExists
-    ? `${robotsAllowsIndex ? "User-agent: * allowed" : "User-agent: * disallows /"}${
-        robotsSitemapListed ? ` • ${robotsSitemaps.length} sitemap URL(s) listed` : ""
-      }`
-    : "robots.txt not found",
-});
-
-
- /** -------- sitemap.xml -------- */
-let sitemapUrl = null;
-let sitemapHasUrls = false;
-let sitemapSampleOk = 0;
-let sitemapGzipped = false;
-
-// common paths + robots.txt advertised URLs (unique)
-const commonPaths = [
-  "/sitemap.xml",
-  "/sitemap_index.xml",
-  "/sitemap-index.xml",
-  "/wp-sitemap.xml", // ← important for WordPress core
-];
-const candidateSet = new Set([
-  ...commonPaths.map((p) => absUrl(origin + "/", p)),
-  ...robotsSitemaps,
-]);
-const candidates = [...candidateSet].filter(Boolean);
-
-// find a reachable sitemap URL (prefer robots-listed first, then common paths)
-const robotsFirst = [...new Set([...(robotsSitemaps || []), ...candidateSet])];
-sitemapUrl = null;
-for (const u of robotsFirst) {
-  if (timeLeft() < 250) break;
-  try {
-    const to = withTimeout(within(LIMITS.TIME_SMALL_MS));
-    let r;
+  if (timeLeft() > 250) {
     try {
-      r = await fetch(u, {
-        method: "GET",
-        redirect: "follow",
-        signal: to.signal,
-        headers: BROWSER_HEADERS,   // more “real browser” to bypass WAF picky HEADs
-        cache: "no-store",
-      });
-    } finally {
-      to.done();
-    }
-    if (r.ok) {
-      const final = r.url || u;     // follow the final URL
-      sitemapUrl = final;
-      const ct = (r.headers.get("content-type") || "").toLowerCase();
-      // one-liners so the line never starts with a regex literal
-      sitemapGzipped =
-        (/\.gz(\?|#|$)/i.test(final)) ||
-        ct.includes("application/gzip") ||
-        ct.includes("application/x-gzip");
-      break;
-    }
-  } catch {}
-}
-
-
-
-if (sitemapUrl) {
-  // If gzipped, don’t try to parse (Edge runtime lacks Node zlib); just report found.
-  if (sitemapGzipped) {
-    checks.push({
-      id: "sitemap",
-      label: "Sitemap exists & URLs valid",
-      status: "warn",
-      details: `Found gzipped sitemap: ${sitemapUrl} (content not parsed)`,
-    });
-  } else {
-    try {
-      await timed("sitemap-get", async () => {
+      const robotsURL = absUrl(origin + "/", "/robots.txt");
+      await timed("robots", async () => {
         const r = await retry(async () => {
-          const tos = withTimeout(within(LIMITS.TIME_PAGE_MS));
+          const tor = withTimeout(within(LIMITS.TIME_SMALL_MS));
           try {
-            return await fetch(sitemapUrl, {
+            return await fetch(robotsURL, {
               redirect: "follow",
-              signal: tos.signal,
+              signal: tor.signal,
               headers: BROWSER_HEADERS,
               cache: "no-store",
             });
           } finally {
-            tos.done();
+            tor.done();
           }
         });
         if (r.ok) {
-          const sitemapFinal = r.url || sitemapUrl; // <- final after redirects
-          const xml = await r.text();
+          robotsExists = true;
+          robotsText = await r.text();
 
-          // Works for both urlset and sitemapindex because we just gather all <loc> values
-          const locs = [...xml.matchAll(/<loc>([\s\S]*?)<\/loc>/gi)].map((m) =>
-            m[1].trim()
-          );
-          const absLocs = locs.map((h) => absUrl(sitemapFinal, h)).filter(Boolean);;
-          sitemapHasUrls = absLocs.length > 0;
-          sitemapUrl = sitemapFinal; // keep the final for your details
+          // index allow/deny (simple check for User-agent: * + Disallow: /)
+          const blocks = robotsText.split(/(?=^User-agent:\s*)/gim);
+          const star = blocks.find((b) => /^User-agent:\s*\*/im.test(b)) || "";
+          if (/^\s*Disallow:\s*\/\s*$/im.test(star)) robotsAllowsIndex = false;
 
-          const toCheck = absLocs.slice(0, LIMITS.SITEMAP_SAMPLES);
-          const results = await Promise.all(
-            toCheck.map(async (u, i) => {
-              if (!spend() || timeLeft() < 200) return false;
-              try {
-                return await timed(`sitemap-sample-${i}`, async () => {
-                  const rr = await tryHeadThenGet(u, {
-                    timeoutMs: within(LIMITS.TIME_ASSET_MS), headers: BROWSER_HEADERS,
-                  });
-                  return isOk(rr);
-                });
-              } catch {
-                return false;
-              }
-            })
-          );
-          sitemapSampleOk = results.filter(Boolean).length;
+          // extract explicit Sitemap: lines
+          const sitemapMatches = [...robotsText.matchAll(/^\s*Sitemap:\s*(\S+)\s*$/gim)];
+          robotsSitemaps = sitemapMatches
+            .map((m) => absUrl(robotsURL, m[1]))
+            .filter(Boolean);
+          robotsSitemapListed = robotsSitemaps.length > 0;
         }
       });
     } catch {}
+  }
+
+  checks.push({
+    id: "robots",
+    label: "robots.txt allows indexing",
+    status: robotsExists ? (robotsAllowsIndex ? "pass" : "fail") : "warn",
+    details: robotsExists
+      ? `${robotsAllowsIndex ? "User-agent: * allowed" : "User-agent: * disallows /"}${
+          robotsSitemapListed ? ` • ${robotsSitemaps.length} sitemap URL(s) listed` : ""
+        }`
+      : "robots.txt not found",
+  });
+
+  /** -------- sitemap.xml -------- */
+  let sitemapUrl = null;
+  let sitemapHasUrls = false;
+  let sitemapSampleOk = 0;
+  let sitemapGzipped = false;
+
+  // common paths + robots.txt advertised URLs (unique)
+  const commonPaths = [
+    "/sitemap.xml",
+    "/sitemap_index.xml",
+    "/sitemap-index.xml",
+    "/wp-sitemap.xml", // ← important for WordPress core
+  ];
+  const candidateSet = new Set([
+    ...commonPaths.map((p) => absUrl(origin + "/", p)),
+    ...robotsSitemaps,
+  ]);
+  const candidates = [...candidateSet].filter(Boolean);
+
+  // find a reachable sitemap URL (prefer robots-listed first, then common paths)
+  const robotsFirst = [...new Set([...(robotsSitemaps || []), ...candidateSet])];
+  sitemapUrl = null;
+  for (const u of robotsFirst) {
+    if (timeLeft() < 250) break;
+    try {
+      const to = withTimeout(within(LIMITS.TIME_SMALL_MS));
+      let r;
+      try {
+        r = await fetch(u, {
+          method: "GET",
+          redirect: "follow",
+          signal: to.signal,
+          headers: BROWSER_HEADERS,   // more “real browser” to bypass WAF picky HEADs
+          cache: "no-store",
+        });
+      } finally {
+        to.done();
+      }
+      if (r.ok) {
+        const final = r.url || u; // follow the final URL
+        sitemapUrl = final;
+        const ct = (r.headers.get("content-type") || "").toLowerCase();
+        // one-liners so the line never starts with a regex literal
+        sitemapGzipped =
+          (/\.gz(\?|#|$)/i.test(final)) ||
+          ct.includes("application/gzip") ||
+          ct.includes("application/x-gzip");
+        break;
+      }
+    } catch {}
+  }
+
+  if (sitemapUrl) {
+    // If gzipped, don’t try to parse (Edge runtime lacks Node zlib); just report found.
+    if (sitemapGzipped) {
+      checks.push({
+        id: "sitemap",
+        label: "Sitemap exists & URLs valid",
+        status: "warn",
+        details: `Found gzipped sitemap: ${sitemapUrl} (content not parsed)`,
+      });
+    } else {
+      try {
+        await timed("sitemap-get", async () => {
+          const r = await retry(async () => {
+            const tos = withTimeout(within(LIMITS.TIME_PAGE_MS));
+            try {
+              return await fetch(sitemapUrl, {
+                redirect: "follow",
+                signal: tos.signal,
+                headers: BROWSER_HEADERS,
+                cache: "no-store",
+              });
+            } finally {
+              tos.done();
+            }
+          });
+          if (r.ok) {
+            const sitemapFinal = r.url || sitemapUrl; // <- final after redirects
+            const xml = await r.text();
+
+            // Works for both urlset and sitemapindex because we just gather all <loc> values
+            const locs = [...xml.matchAll(/<loc>([\s\S]*?)<\/loc>/gi)].map((m) =>
+              m[1].trim()
+            );
+            const absLocs = locs.map((h) => absUrl(sitemapFinal, h)).filter(Boolean);
+            sitemapHasUrls = absLocs.length > 0;
+            sitemapUrl = sitemapFinal; // keep the final for your details
+
+            const toCheck = absLocs.slice(0, LIMITS.SITEMAP_SAMPLES);
+            const results = await Promise.all(
+              toCheck.map(async (u, i) => {
+                if (!spend() || timeLeft() < 200) return false;
+                try {
+                  return await timed(`sitemap-sample-${i}`, async () => {
+                    const rr = await tryHeadThenGet(u, {
+                      timeoutMs: within(LIMITS.TIME_ASSET_MS), headers: BROWSER_HEADERS,
+                    });
+                    return isOk(rr);
+                  });
+                } catch {
+                  return false;
+                }
+              })
+            );
+            sitemapSampleOk = results.filter(Boolean).length;
+          }
+        });
+      } catch {}
+      checks.push({
+        id: "sitemap",
+        label: "Sitemap exists & URLs valid",
+        status:
+          sitemapHasUrls && sitemapSampleOk > 0 ? "pass" : "warn",
+        details: `Found: ${sitemapUrl} • URLs: ${
+          sitemapHasUrls ? "yes" : "no"
+        } • Valid samples: ${sitemapSampleOk}`,
+      });
+    }
+  } else {
     checks.push({
       id: "sitemap",
       label: "Sitemap exists & URLs valid",
-      status:
-        sitemapHasUrls && sitemapSampleOk > 0 ? "pass" : "warn",
-      details: `Found: ${sitemapUrl} • URLs: ${
-        sitemapHasUrls ? "yes" : "no"
-      } • Valid samples: ${sitemapSampleOk}`,
+      status: "fail",
+      details: `No sitemap found at common paths or in robots.txt`,
     });
   }
-} else {
-  checks.push({
-    id: "sitemap",
-    label: "Sitemap exists & URLs valid",
-    status: "fail",
-    details: `No sitemap found at common paths or in robots.txt`,
-  });
-}
-
 
   /** -------- www ↔ non-www redirect -------- */
   let canonicalization = { tested: false, from: "", to: "", code: 0, good: false };
@@ -1128,56 +1114,55 @@ if (sitemapUrl) {
   });
 
   /** -------- Noindex (hard-fail) + Robots directives -------- */
-const robotsMeta = (getMetaName(html, "robots") || "").toLowerCase();
-const googlebotMeta = (getMetaName(html, "googlebot") || "").toLowerCase();
-const bingbotMeta = (getMetaName(html, "bingbot") || "").toLowerCase();
-const xRobotsHeader = (pageRes.headers.get("x-robots-tag") || "").toLowerCase();
+  const robotsMeta = (getMetaName(html, "robots") || "").toLowerCase();
+  const googlebotMeta = (getMetaName(html, "googlebot") || "").toLowerCase();
+  const bingbotMeta = (getMetaName(html, "bingbot") || "").toLowerCase();
+  const xRobotsHeader = (pageRes.headers.get("x-robots-tag") || "").toLowerCase();
 
-// 'none' equals 'noindex,nofollow'
-const hasNoindex = (s) => /\bnoindex\b/.test(s) || /\bnone\b/.test(s);
+  // 'none' equals 'noindex,nofollow'
+  const hasNoindex = (s) => /\bnoindex\b/.test(s) || /\bnone\b/.test(s);
 
-// where exactly did we see it?
-const noindexSources = [];
-if (hasNoindex(robotsMeta)) noindexSources.push("meta[name=robots]");
-if (hasNoindex(googlebotMeta)) noindexSources.push("meta[name=googlebot]");
-if (hasNoindex(bingbotMeta)) noindexSources.push("meta[name=bingbot]");
-if (hasNoindex(xRobotsHeader)) noindexSources.push("X-Robots-Tag header");
+  // where exactly did we see it?
+  const noindexSources = [];
+  if (hasNoindex(robotsMeta)) noindexSources.push("meta[name=robots]");
+  if (hasNoindex(googlebotMeta)) noindexSources.push("meta[name=googlebot]");
+  if (hasNoindex(bingbotMeta)) noindexSources.push("meta[name=bingbot]");
+  if (hasNoindex(xRobotsHeader)) noindexSources.push("X-Robots-Tag header");
 
-// New: dedicated noindex check (very bad for SEO)
-checks.push({
-  id: "noindex",
-  label: "Noindex directive",
-  status: noindexSources.length ? "fail" : "pass",
-  details: noindexSources.length
-    ? `Found in: ${noindexSources.join(", ")}`
-    : "Not detected",
-});
+  // New: dedicated noindex check (very bad for SEO)
+  checks.push({
+    id: "noindex",
+    label: "Noindex directive",
+    status: noindexSources.length ? "fail" : "pass",
+    details: noindexSources.length
+      ? `Found in: ${noindexSources.join(", ")}`
+      : "Not detected",
+  });
 
-// Keep a separate, more general “robots directives” card (informational).
-// We avoid double-failing here: if 'noindex' exists, this becomes 'warn'.
-const robotsStrings = [
-  robotsMeta && `meta: ${robotsMeta}`,
-  googlebotMeta && `googlebot: ${googlebotMeta}`,
-  bingbotMeta && `bingbot: ${bingbotMeta}`,
-  xRobotsHeader && `header: ${xRobotsHeader}`,
-].filter(Boolean);
+  // Keep a separate, more general “robots directives” card (informational).
+  // We avoid double-failing here: if 'noindex' exists, this becomes 'warn'.
+  const robotsStrings = [
+    robotsMeta && `meta: ${robotsMeta}`,
+    googlebotMeta && `googlebot: ${googlebotMeta}`,
+    bingbotMeta && `bingbot: ${bingbotMeta}`,
+    xRobotsHeader && `header: ${xRobotsHeader}`,
+  ].filter(Boolean);
 
-checks.push({
-  id: "meta-robots",
-  label: "Robots directives",
-  status: robotsStrings.length ? (noindexSources.length ? "warn" : "pass") : "pass",
-  details: robotsStrings.length ? robotsStrings.join(" | ") : "None",
-});
-
+  checks.push({
+    id: "meta-robots",
+    label: "Robots directives",
+    status: robotsStrings.length ? (noindexSources.length ? "warn" : "pass") : "pass",
+    details: robotsStrings.length ? robotsStrings.join(" | ") : "None",
+  });
 
   /** -------- Meta description + title length -------- */
-  metaDesc = getMetaName(html, "description") || "";
-  const titleLen = (title || "").trim().length;
+  pageMetaDesc = getMetaName(html, "description") || "";
+  const titleLen = (pageTitle || "").trim().length;
   checks.push({
     id: "meta-description",
     label: "Meta description length",
-    status: metaDesc ? (metaDesc.length >= 50 && metaDesc.length <= 160 ? "pass" : "warn") : "fail",
-    details: metaDesc ? `${metaDesc.length} chars` : "Missing",
+    status: pageMetaDesc ? (pageMetaDesc.length >= 50 && pageMetaDesc.length <= 160 ? "pass" : "warn") : "fail",
+    details: pageMetaDesc ? `${pageMetaDesc.length} chars` : "Missing",
   });
   checks.push({
     id: "title-length",
@@ -1261,23 +1246,12 @@ checks.push({
     finalUrl,
     fetchedStatus: pageRes.status,
     timingMs,
-    title,
-    metaTitle: title, 
-    metaDescription: metaDesc,
+    title: pageTitle,
+    metaTitle: pageTitle || "",
+    metaDescription: pageMetaDesc || "",
     speed: psi,
     checks,
   };
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
-
-
-
-
-
-
-
-
-
-
-
