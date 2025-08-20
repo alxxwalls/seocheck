@@ -470,6 +470,10 @@ async function runAudit(req, rawUrl) {
       details: statusText,
     });
 
+    // hoisted so early-return paths can reference safely
+let title = "";
+let metaDesc = "";
+
    // favicon
     try {
       const favUrl = new URL("/favicon.ico", normalizedUrl).toString();
@@ -798,7 +802,7 @@ return payload;
   const timingMs = Date.now() - t0;
   const finalUrl = pageRes.url;
 
-  const title = parseTitle(html);
+  title = parseTitle(html);
   const urlObj = new URL(finalUrl);
   const origin = `${urlObj.protocol}//${urlObj.host}`;
   const host = urlObj.host;
@@ -1167,7 +1171,7 @@ checks.push({
 
 
   /** -------- Meta description + title length -------- */
-  const metaDesc = getMetaName(html, "description") || "";
+  metaDesc = getMetaName(html, "description") || "";
   const titleLen = (title || "").trim().length;
   checks.push({
     id: "meta-description",
@@ -1266,6 +1270,7 @@ checks.push({
   if (process.env.DEBUG_AUDIT === "1") payload._diag = DIAG;
   return payload;
 }
+
 
 
 
