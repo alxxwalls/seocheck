@@ -357,6 +357,67 @@ function makeH1Check(html = "") {
   }
 }
 
+// ---- Platform / CMS detector ----
+function makePlatformCheck(html = "", headers, finalUrl = "") {
+  if (!html || typeof html !== "string") return null;
+
+  const h = headers && typeof headers.get === "function" ? headers : null;
+  const header = (k) => (h ? (h.get(k) || "") : "");
+  const generator = (getMetaName(html, "generator") || "").toLowerCase();
+
+  const hints = new Set();
+
+  // --- WordPress ---
+  if (
+    /wp-content|wp-includes|\/wp-json\b|wp-embed\.min\.js/i.test(html) ||
+    generator.includes("wordpress") ||
+    /x-powered-by:\s*wpengine/i.test(header("server") + " " + header("x-powered-by"))
+  ) {
+    hints.add("WordPress");
+  }
+
+  // --- Shopify ---
+  if (
+    /cdn\.shopify\.com|myshopify\.com|shopify\.js/i.test(html) ||
+    /\bShopify\b/.test(generator) ||
+    /x-shopid|x-shopify|x-request-id/i.test(
+      header("x-shopify-stage") + " " + header("x-shopid") + " " + header("x-request-id")
+    )
+  ) {
+    hints.add("Shopify");
+  }
+
+  // --- Wix ---
+  if (
+    /static\.parastorage\.com|wixstatic\.com|wixapps/i.test(html) ||
+    generator.includes("wix") ||
+    /x-wix/i.test(header("server") + " " + header("x-wix-renderer-server"))
+  ) {
+    hints.add("Wix");
+  }
+
+  // --- Framer ---
+  if (
+    /framerusercontent\.com|data-framer|name=["']framer-/i.test(html) ||
+    generator.includes("framer")
+  ) {
+    hints.add("Framer");
+  }
+
+  // (You can extend: Webflow, Squarespace, Ghost, etc.)
+
+  const list = Array.from(hints);
+  const present = list.length > 0;
+
+  return {
+    id: "platform",
+    label: "Platform / CMS",
+    status: present ? (list.length > 1 ? "warn" : "pass") : "warn",
+    details: present ? list.join(" + ") : "Not detected (custom or obfuscated)",
+    value: list,
+  };
+}
+
 /** ---------- GET ---------- */
 export async function GET(req) {
   const { searchParams } = new URL(req.url)
@@ -676,6 +737,8 @@ function makeH1Check(html = "") {
     value: count,           // numeric value for clients if needed
   };
 }
+
+    
 
     // sitemap probe (HEAD/GET some common paths + robots-listed)
     const origin = (() => {
@@ -1448,6 +1511,13 @@ if (h1Check) checks.push(h1Check);
   const gaCheck = makeGACheck(html);
   if (gaCheck) checks.push(gaCheck);
 }
+
+    /** -------- Platform / CMS -------- */
+{
+  const platformCheck = makePlatformCheck(html, pageRes.headers, finalUrl);
+  if (platformCheck) checks.push(platformCheck);
+}
+
     
     /** -------- Images -------- */
     const imgTags = [...html.matchAll(/<img[^>]*>/gi)]
@@ -1580,6 +1650,7 @@ if (h1Check) checks.push(h1Check);
     throw e
   }
 }
+
 
 
 
