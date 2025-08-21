@@ -70,6 +70,22 @@ const LOCK_PLACEHOLDER = (id) => ({
   locked: true,
 })
 
+// --- Meta title quality config ---
+const GENERIC_TITLE_PATTERNS = [
+  /\bhome\b/i,
+  /\bhomepage\b/i,
+  /\bwelcome\b/i,
+  /\bindex\b/i,
+  /\buntitled\b/i,
+  /\bmain\s*page\b/i,
+  /\bstart\b/i,
+]
+
+function isGenericTitle(t = "") {
+  const s = String(t || "").trim()
+  if (!s) return false
+  return GENERIC_TITLE_PATTERNS.some((re) => re.test(s))
+
 // ---------- Banner copy ----------
 const DEFAULT_CRAWLER_MSG =
   "This website is not responding properly to our crawler, meaning results shown in this report may be incomplete, or inaccurate. It's likely there is a firewall or other security mechanism in place preventing us viewing the content successfully."
@@ -1337,25 +1353,50 @@ function makeH1Check(html = "") {
       details: robotsStrings.length ? robotsStrings.join(" | ") : "None",
     })
 
-    /** -------- Meta description + title length -------- */
-    metaDesc = getMetaName(html, "description") || ""
-    const titleLen = (title || "").trim().length
-    checks.push({
-      id: "meta-description",
-      label: "Meta description length",
-      status: metaDesc
-        ? metaDesc.length >= 50 && metaDesc.length <= 160
-          ? "pass"
-          : "warn"
-        : "fail",
-      details: metaDesc ? `${metaDesc.length} chars` : "Missing",
-    })
-    checks.push({
-      id: "title-length",
-      label: "Title length",
-      status: titleLen ? (titleLen >= 25 && titleLen <= 60 ? "pass" : "warn") : "fail",
-      details: titleLen ? `${titleLen} chars` : "Missing",
-    })
+    /** -------- Meta description + title quality -------- */
+metaDesc = getMetaName(html, "description") || ""
+
+const rawTitle = (title || "").trim()
+const titleLen = rawTitle.length
+const genericTitle = isGenericTitle(rawTitle)
+
+checks.push({
+  id: "meta-description",
+  label: "Meta description length",
+  status: metaDesc
+    ? metaDesc.length >= 50 && metaDesc.length <= 160
+      ? "pass"
+      : "warn"
+    : "fail",
+  details: metaDesc ? `${metaDesc.length} chars` : "Missing",
+})
+
+// Fail if <10 chars OR looks generic; otherwise keep your pass/warn bands
+let titleStatus = "fail"
+let titleDetails = "Missing"
+
+if (titleLen) {
+  if (titleLen < 10) {
+    titleStatus = "fail"
+    titleDetails = `${titleLen} chars (too short)`
+  } else if (genericTitle) {
+    titleStatus = "fail"
+    titleDetails = "Generic title detected (e.g., ‘Home’, ‘Homepage’, ‘Welcome’)"
+  } else if (titleLen >= 25 && titleLen <= 60) {
+    titleStatus = "pass"
+    titleDetails = `${titleLen} chars`
+  } else {
+    titleStatus = "warn"
+    titleDetails = `${titleLen} chars`
+  }
+}
+
+checks.push({
+  id: "title-length",        // keep same id so UI/weights still work
+  label: "Title length",     // label can stay as-is
+  status: titleStatus,
+  details: titleDetails,
+})
 
     /** -------- Viewport -------- */
     const hasViewport = /<meta[^>]+name=["']viewport["'][^>]*>/i.test(html)
@@ -1503,6 +1544,7 @@ if (h1Check) checks.push(h1Check);
     throw e
   }
 }
+
 
 
 
