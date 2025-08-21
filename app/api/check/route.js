@@ -289,6 +289,27 @@ const getMetaBy = (html, attr, name) => {
 const getMetaName = (html, name) => getMetaBy(html, "name", name)
 const getMetaProp = (html, prop) => getMetaBy(html, "property", prop)
 
+/** ---------- H1 check (top-level, unlocked) ---------- */
+const H1_LABEL = LABELS["h1-structure"] || "H1 Structure"
+function makeH1Check(html = "") {
+  if (!html || typeof html !== "string") return null
+  const matches = html.match(/<h1\b[^>]*>/gi)
+  const count = matches ? matches.length : 0
+  let status = "fail"
+  if (count === 1) status = "pass"
+  else if (count > 1) status = "warn"
+  return {
+    id: "h1-structure",
+    label: H1_LABEL,
+    status,
+    details:
+      count === 0
+        ? "No <h1> tag found on the page."
+        : `Found ${count} <h1> ${count === 1 ? "tag" : "tags"}.`,
+    value: count,
+  }
+}
+
 /** ---------- GET ---------- */
 export async function GET(req) {
   const { searchParams } = new URL(req.url)
@@ -1482,6 +1503,7 @@ if (h1Check) checks.push(h1Check);
     throw e
   }
 }
+
 
 
 
