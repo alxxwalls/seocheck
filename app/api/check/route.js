@@ -623,6 +623,36 @@ async function runAudit(req, rawUrl) {
         details: "Unavailable",
       })
     }
+//GA Checker
+    function makeGACheck(html = "") {
+  if (!html || typeof html !== "string") return null;
+
+  // GA4 gtag.js
+  const hasGA4ByScript = /googletagmanager\.com\/gtag\/js\?id=G-[A-Z0-9]+/i.test(html);
+  const hasGA4ByCode   = /\bgtag\(\s*['"]config['"]\s*,\s*['"]G-[A-Z0-9]+/i.test(html);
+
+  // Google Tag Manager
+  const hasGTMByScript = /googletagmanager\.com\/gtm\.js\?id=GTM-[A-Z0-9]+/i.test(html);
+  const hasGTMId       = /\bGTM-[A-Z0-9]+\b/.test(html);
+
+  // Legacy UA
+  const hasUAByScript  = /google-analytics\.com\/analytics\.js/i.test(html);
+  const hasUAByCode    = /\bga\(\s*['"]create['"]/i.test(html) || /\bUA-\d{4,9}-\d+\b/i.test(html);
+
+  const found = [];
+  if (hasGA4ByScript || hasGA4ByCode) found.push("GA4 gtag.js");
+  if (hasGTMByScript || hasGTMId)     found.push("Google Tag Manager");
+  if (hasUAByScript || hasUAByCode)   found.push("Universal Analytics");
+
+  const present = found.length > 0;
+  return {
+    id: "ga",
+    label: "Google Analytics",
+    status: present ? "pass" : "fail",
+    details: present ? found.join(" + ") : "Not detected",
+    value: present ? found : [],
+  };
+}
 
     //H1 checker
 function makeH1Check(html = "") {
@@ -1412,6 +1442,12 @@ checks.push({
 const h1Check = makeH1Check(html);
 if (h1Check) checks.push(h1Check);
     }
+
+    /** -------- Google Analytics (GA / GTM) -------- */
+{
+  const gaCheck = makeGACheck(html);
+  if (gaCheck) checks.push(gaCheck);
+}
     
     /** -------- Images -------- */
     const imgTags = [...html.matchAll(/<img[^>]*>/gi)]
@@ -1544,6 +1580,7 @@ if (h1Check) checks.push(h1Check);
     throw e
   }
 }
+
 
 
 
