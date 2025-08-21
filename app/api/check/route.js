@@ -587,6 +587,29 @@ async function runAudit(req, rawUrl) {
       })
     }
 
+    //H1 checker
+function makeH1Check(html = "") {
+  if (!html || typeof html !== "string") return null; // no HTML -> skip (partial audits stay partial)
+
+  // Count <h1 ...> tags (simple + fast)
+  const matches = html.match(/<h1\b[^>]*>/gi);
+  const count = matches ? matches.length : 0;
+
+  let status = "fail";
+  if (count === 1) status = "pass";
+  else if (count > 1) status = "warn";
+
+  return {
+    id: "h1-structure",
+    status,                 // "pass" | "warn" | "fail"
+    details:
+      count === 0
+        ? "No <h1> tag found on the page."
+        : `Found ${count} <h1> ${count === 1 ? "tag" : "tags"}.`,
+    value: count,           // numeric value for clients if needed
+  };
+}
+
     // sitemap probe (HEAD/GET some common paths + robots-listed)
     const origin = (() => {
       try {
@@ -629,8 +652,8 @@ async function runAudit(req, rawUrl) {
     })
 
     // locked teasers
-    for (const id of OMIT_CHECKS) checks.push(LOCK_PLACEHOLDER(id))
-    for (const id of ["h1-structure", "llms"]) checks.push(LOCK_PLACEHOLDER(id))
+   for (const id of OMIT_CHECKS) checks.push(LOCK_PLACEHOLDER(id))
+    checks.push(LOCK_PLACEHOLDER("llms"))
 
     // PSI quick
     let psi
@@ -868,8 +891,8 @@ async function runAudit(req, rawUrl) {
         }
 
         // teasers
-        for (const id of OMIT_CHECKS) checks.push(LOCK_PLACEHOLDER(id))
-        for (const id of ["h1-structure", "llms"]) checks.push(LOCK_PLACEHOLDER(id))
+      for (const id of OMIT_CHECKS) checks.push(LOCK_PLACEHOLDER(id))
+    checks.push(LOCK_PLACEHOLDER("llms"))
 
         const payload = {
           ok: true,
@@ -1322,6 +1345,10 @@ async function runAudit(req, rawUrl) {
       details: hasViewport ? "Present" : "Missing",
     })
 
+    /** -------- H1 structure -------- */
+const h1Check = makeH1Check(html);
+if (h1Check) checks.push(h1Check);
+
     /** -------- Images -------- */
     const imgTags = [...html.matchAll(/<img[^>]*>/gi)]
       .map((m) => m[0])
@@ -1391,8 +1418,8 @@ async function runAudit(req, rawUrl) {
 
     /** -------- placeholders -------- */
     for (const id of OMIT_CHECKS) checks.push(LOCK_PLACEHOLDER(id))
-    for (const id of ["h1-structure", "llms"]) checks.push(LOCK_PLACEHOLDER(id))
-
+    checks.push(LOCK_PLACEHOLDER("llms"))
+    
     /** -------- PSI (optional) -------- */
     let psi = undefined
     if (spend(2) && timeLeft() > 2000) {
@@ -1453,3 +1480,4 @@ async function runAudit(req, rawUrl) {
     throw e
   }
 }
+
