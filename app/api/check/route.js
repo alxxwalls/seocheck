@@ -1346,9 +1346,11 @@ function makeH1Check(html = "") {
     })
 
     /** -------- H1 structure -------- */
+    if (htmnl) {
 const h1Check = makeH1Check(html);
 if (h1Check) checks.push(h1Check);
-
+    }
+    
     /** -------- Images -------- */
     const imgTags = [...html.matchAll(/<img[^>]*>/gi)]
       .map((m) => m[0])
@@ -1480,4 +1482,5 @@ if (h1Check) checks.push(h1Check);
     throw e
   }
 }
+
 
