@@ -85,7 +85,7 @@ function isGenericTitle(t = "") {
   const s = String(t || "").trim()
   if (!s) return false
   return GENERIC_TITLE_PATTERNS.some((re) => re.test(s))
-
+}
 // ---------- Banner copy ----------
 const DEFAULT_CRAWLER_MSG =
   "This website is not responding properly to our crawler, meaning results shown in this report may be incomplete, or inaccurate. It's likely there is a firewall or other security mechanism in place preventing us viewing the content successfully."
@@ -1544,6 +1544,7 @@ if (h1Check) checks.push(h1Check);
     throw e
   }
 }
+
 
 
 
