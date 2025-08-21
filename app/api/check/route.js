@@ -1346,7 +1346,7 @@ function makeH1Check(html = "") {
     })
 
     /** -------- H1 structure -------- */
-    if (htmnl) {
+    if (html) {
 const h1Check = makeH1Check(html);
 if (h1Check) checks.push(h1Check);
     }
@@ -1482,5 +1482,6 @@ if (h1Check) checks.push(h1Check);
     throw e
   }
 }
+
 
 
